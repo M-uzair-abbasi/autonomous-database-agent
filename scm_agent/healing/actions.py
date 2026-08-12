@@ -7,12 +7,22 @@ type checks immediately before an approved plan is executed.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from datetime import datetime
 from hashlib import sha256
 from typing import Mapping
 
 from .config import HealingConfig
-from .models import ActionKind, ActionPlan, Finding, Mode, RuleId, TargetKind
+from .models import (
+    ActionKind,
+    ActionPlan,
+    BackendTarget,
+    Finding,
+    IndexTarget,
+    Mode,
+    RuleId,
+    TableTarget,
+    TargetKind,
+)
 
 
 _TERMINATE_TEMPLATE = "SELECT pg_terminate_backend(?)"
@@ -45,45 +55,6 @@ def build_reindex_command(schema: str, index: str) -> str:
     return f"REINDEX INDEX CONCURRENTLY {qualified_identifier(schema, index)}"
 
 
-@dataclass(frozen=True)
-class TableTarget:
-    schema: str
-    table: str
-
-    @property
-    def parameters(self) -> Mapping[str, object]:
-        return {"schema": self.schema, "table": self.table}
-
-
-@dataclass(frozen=True)
-class IndexTarget:
-    schema: str
-    index: str
-
-    @property
-    def parameters(self) -> Mapping[str, object]:
-        return {"schema": self.schema, "index": self.index}
-
-
-@dataclass(frozen=True)
-class BackendTarget:
-    database_oid: int
-    pid: int
-    state: str
-    role_name: str | None
-    application_name: str | None
-
-    @property
-    def parameters(self) -> Mapping[str, object]:
-        return {
-            "database_oid": self.database_oid,
-            "pid": self.pid,
-            "state": self.state,
-            "role_name": self.role_name,
-            "application_name": self.application_name,
-        }
-
-
 def _required_string(evidence: Mapping[str, object], key: str) -> str:
     value = evidence.get(key)
     if not isinstance(value, str):
@@ -98,19 +69,21 @@ def _required_integer(evidence: Mapping[str, object], key: str) -> int:
     return value
 
 
-def _optional_string(evidence: Mapping[str, object], key: str) -> str | None:
+def _required_aware_datetime(evidence: Mapping[str, object], key: str) -> datetime:
     value = evidence.get(key)
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise ValueError(f"finding evidence {key} must be a string when present")
+    if not isinstance(value, datetime):
+        raise ValueError(f"finding evidence {key} must be a datetime")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"finding evidence {key} must be timezone-aware")
     return value
 
 
 def _table_target(finding: Finding) -> TableTarget:
     return TableTarget(
-        schema=_required_string(finding.evidence, "schema_name"),
-        table=_required_string(finding.evidence, "relation_name"),
+        database_oid=_required_integer(finding.evidence, "database_oid"),
+        relation_oid=_required_integer(finding.evidence, "relation_oid"),
+        schema_name=_required_string(finding.evidence, "schema_name"),
+        relation_name=_required_string(finding.evidence, "relation_name"),
     )
 
 
@@ -118,9 +91,12 @@ def _backend_target(finding: Finding) -> BackendTarget:
     return BackendTarget(
         database_oid=_required_integer(finding.evidence, "database_oid"),
         pid=_required_integer(finding.evidence, "pid"),
+        backend_start=_required_aware_datetime(finding.evidence, "backend_start"),
+        transaction_start=_required_aware_datetime(finding.evidence, "transaction_start"),
+        state_change=_required_aware_datetime(finding.evidence, "state_change"),
         state=_required_string(finding.evidence, "state"),
-        role_name=_optional_string(finding.evidence, "role_name"),
-        application_name=_optional_string(finding.evidence, "application_name"),
+        role_name=_required_string(finding.evidence, "role_name"),
+        application_name=_required_string(finding.evidence, "application_name"),
     )
 
 
@@ -148,13 +124,14 @@ class ActionPlanner:
         ):
             try:
                 target = _table_target(finding)
-                command = build_vacuum_command(target.schema, target.table)
+                command = build_vacuum_command(target.schema_name, target.relation_name)
             except (TypeError, ValueError):
                 return None
             return ActionPlan(
                 action_kind=ActionKind.VACUUM,
                 finding_fingerprint=finding.fingerprint,
                 target_kind=TargetKind.TABLE,
+                target=target,
                 target_key=finding.target_key,
                 command=command,
                 parameters=target.parameters,
@@ -178,6 +155,7 @@ class ActionPlanner:
                 action_kind=ActionKind.TERMINATE_BACKEND,
                 finding_fingerprint=finding.fingerprint,
                 target_kind=TargetKind.BACKEND,
+                target=target,
                 target_key=finding.target_key,
                 command=_TERMINATE_TEMPLATE,
                 parameters=target.parameters,
@@ -207,16 +185,19 @@ class ActionPlanner:
             raise ValueError("manual reindex is unavailable in observe mode")
         if config.mode is Mode.ACT and not confirmed:
             raise ValueError("manual reindex in act mode requires confirmation")
+        quote_identifier(schema)
+        quote_identifier(index)
         if _is_system_schema(schema):
             raise ValueError("manual reindex rejects system schema targets")
 
-        target = IndexTarget(schema=schema, index=index)
-        command = build_reindex_command(target.schema, target.index)
+        target = IndexTarget(schema_name=schema, index_name=index)
+        command = build_reindex_command(target.schema_name, target.index_name)
         fingerprint = _manual_fingerprint(schema, index)
         return ActionPlan(
             action_kind=ActionKind.REINDEX_INDEX,
             finding_fingerprint=fingerprint,
             target_kind=TargetKind.INDEX,
+            target=target,
             target_key=fingerprint,
             command=command,
             parameters=target.parameters,

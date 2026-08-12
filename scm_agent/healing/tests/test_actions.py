@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from dataclasses import FrozenInstanceError
+from datetime import datetime, timedelta, timezone
 import unittest
 
 from scm_agent.healing.actions import (
@@ -13,10 +14,24 @@ from scm_agent.healing.actions import (
     quote_identifier,
 )
 from scm_agent.healing.config import HealingConfig
-from scm_agent.healing.models import Finding, Mode, RuleId, Severity, TargetKind
+from scm_agent.healing.models import (
+    ActionKind,
+    ActionPlan,
+    BackendTarget,
+    Finding,
+    IndexTarget,
+    Mode,
+    RuleId,
+    Severity,
+    TableTarget,
+    TargetKind,
+)
 
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
+BACKEND_START = NOW - timedelta(hours=1)
+TRANSACTION_START = NOW - timedelta(minutes=30)
+STATE_CHANGE = NOW - timedelta(minutes=20)
 
 
 def finding(
@@ -32,10 +47,12 @@ def finding(
         "schema_name": "public",
         "relation_name": "orders",
         "pid": 123,
-        "backend_start": "2026-08-12T11:00:00+00:00",
-        "transaction_start": "2026-08-12T11:30:00+00:00",
-        "state_change": "2026-08-12T11:40:00+00:00",
+        "backend_start": BACKEND_START,
+        "transaction_start": TRANSACTION_START,
+        "state_change": STATE_CHANGE,
         "state": "idle in transaction",
+        "role_name": "scm",
+        "application_name": "psql",
     }
     if evidence:
         default_evidence.update(evidence)
@@ -127,7 +144,24 @@ class ActionPlannerTests(unittest.TestCase):
         self.assertEqual(dry_run.action_kind.value, "vacuum")
         self.assertEqual(dry_run.target_kind, TargetKind.TABLE)
         self.assertEqual(dry_run.command, 'VACUUM (SKIP_LOCKED TRUE, TRUNCATE FALSE) "public"."orders"')
-        self.assertEqual(dry_run.parameters, {"schema": "public", "table": "orders"})
+        self.assertEqual(
+            dry_run.target,
+            TableTarget(
+                database_oid=17,
+                relation_oid=42,
+                schema_name="public",
+                relation_name="orders",
+            ),
+        )
+        self.assertEqual(
+            dry_run.parameters,
+            {
+                "database_oid": 17,
+                "relation_oid": 42,
+                "schema": "public",
+                "table": "orders",
+            },
+        )
         self.assertEqual(dry_run.mode, Mode.DRY_RUN)
         self.assertEqual(act.mode, Mode.ACT)
         self.assertEqual(dry_run.reason, "auto_vacuum_dead_tuple_pressure")
@@ -162,8 +196,119 @@ class ActionPlannerTests(unittest.TestCase):
         self.assertEqual(plan.action_kind.value, "terminate_backend")
         self.assertEqual(plan.command, "SELECT pg_terminate_backend(?)")
         self.assertEqual(plan.parameters["pid"], 123)
+        self.assertEqual(
+            plan.target,
+            BackendTarget(
+                database_oid=17,
+                pid=123,
+                backend_start=BACKEND_START,
+                transaction_start=TRANSACTION_START,
+                state_change=STATE_CHANGE,
+                state="idle in transaction",
+                role_name="scm",
+                application_name="psql",
+            ),
+        )
         self.assertEqual(plan.mode, Mode.ACT)
         self.assertEqual(plan.reason, "auto_terminate_idle_in_transaction")
+
+    def test_termination_rejects_missing_or_naive_session_identity(self) -> None:
+        enabled = HealingConfig(mode=Mode.ACT, allow_terminate_idle_transaction=True)
+
+        self.assertIsNone(
+            self.planner.plan(
+                finding(
+                    RuleId.IDLE_IN_TRANSACTION,
+                    TargetKind.BACKEND,
+                    evidence={"transaction_start": None},
+                ),
+                enabled,
+            )
+        )
+        self.assertIsNone(
+            self.planner.plan(
+                finding(
+                    RuleId.IDLE_IN_TRANSACTION,
+                    TargetKind.BACKEND,
+                    evidence={"backend_start": BACKEND_START.replace(tzinfo=None)},
+                ),
+                enabled,
+            )
+        )
+
+    def test_same_table_name_with_different_oids_creates_distinct_typed_targets(self) -> None:
+        config = HealingConfig(mode=Mode.DRY_RUN)
+        first = self.planner.plan(
+            finding(RuleId.DEAD_TUPLE_PRESSURE, TargetKind.TABLE), config
+        )
+        second = self.planner.plan(
+            finding(
+                RuleId.DEAD_TUPLE_PRESSURE,
+                TargetKind.TABLE,
+                evidence={"relation_oid": 43},
+            ),
+            config,
+        )
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        assert first is not None and second is not None
+        self.assertNotEqual(first.target, second.target)
+        self.assertEqual(first.target.schema_name, second.target.schema_name)
+        self.assertEqual(first.target.relation_name, second.target.relation_name)
+
+    def test_target_evidence_and_parameters_are_immutable_copies(self) -> None:
+        source_evidence = {
+            "database_oid": 17,
+            "relation_oid": 42,
+            "schema_name": "public",
+            "relation_name": "orders",
+            "nested": {"relation_oid": 42},
+        }
+        item = finding(
+            RuleId.DEAD_TUPLE_PRESSURE,
+            TargetKind.TABLE,
+            evidence=source_evidence,
+        )
+        source_evidence["relation_oid"] = 999
+        source_evidence["nested"]["relation_oid"] = 999
+        plan = self.planner.plan(item, HealingConfig(mode=Mode.DRY_RUN))
+
+        self.assertEqual(item.evidence["relation_oid"], 42)
+        self.assertEqual(item.evidence["nested"]["relation_oid"], 42)
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        with self.assertRaises(TypeError):
+            plan.parameters["relation_oid"] = 999  # type: ignore[index]
+        with self.assertRaises(FrozenInstanceError):
+            plan.target.relation_oid = 999  # type: ignore[misc]
+
+    def test_model_rejects_incomplete_backend_identity_and_mismatched_action(self) -> None:
+        with self.assertRaisesRegex(ValueError, "transaction_start"):
+            BackendTarget(
+                database_oid=17,
+                pid=123,
+                backend_start=BACKEND_START,
+                transaction_start=None,  # type: ignore[arg-type]
+                state_change=STATE_CHANGE,
+                state="idle in transaction",
+                role_name="scm",
+                application_name="psql",
+            )
+
+        index_target = IndexTarget(schema_name="public", index_name="orders_idx")
+        with self.assertRaisesRegex(ValueError, "action_kind"):
+            ActionPlan(
+                action_kind=ActionKind.VACUUM,
+                finding_fingerprint="fixture",
+                target_kind=TargetKind.INDEX,
+                target=index_target,
+                target_key="fixture",
+                command='VACUUM (SKIP_LOCKED TRUE, TRUNCATE FALSE) "public"."orders"',
+                parameters=index_target.parameters,
+                mode=Mode.DRY_RUN,
+                reason="fixture",
+            )
 
     def test_advisory_rules_never_create_destructive_plans(self) -> None:
         cases = (
@@ -198,7 +343,20 @@ class ActionPlannerTests(unittest.TestCase):
 
         self.assertEqual(plan.action_kind.value, "reindex_index")
         self.assertEqual(plan.target_kind, TargetKind.INDEX)
+        self.assertEqual(
+            plan.target,
+            IndexTarget(schema_name="public", index_name="orders_idx"),
+        )
         self.assertEqual(plan.command, 'REINDEX INDEX CONCURRENTLY "public"."orders_idx"')
-        self.assertEqual(plan.parameters, {"schema": "public", "index": "orders_idx"})
+        self.assertEqual(
+            plan.parameters,
+            {
+                "schema": "public",
+                "index": "orders_idx",
+                "database_oid": None,
+                "index_oid": None,
+                "parent_relation_oid": None,
+            },
+        )
         self.assertEqual(plan.mode, Mode.DRY_RUN)
         self.assertEqual(plan.reason, "manual_reindex_requested")

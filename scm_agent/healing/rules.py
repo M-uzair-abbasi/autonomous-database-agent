@@ -130,6 +130,9 @@ def detect_idle_transactions(
                 evidence={
                     "database_oid": sample.database_oid,
                     "pid": sample.pid,
+                    "backend_start": sample.backend_start,
+                    "transaction_start": sample.transaction_start,
+                    "state_change": sample.state_change,
                     "role_name": sample.role_name,
                     "application_name": sample.application_name,
                     "state": sample.state,

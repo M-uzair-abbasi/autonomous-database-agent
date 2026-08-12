@@ -144,6 +144,10 @@ class IdleTransactionTests(unittest.TestCase):
         self.assertEqual([finding.rule_id for finding in findings], [RuleId.IDLE_IN_TRANSACTION] * 2)
         self.assertEqual([finding.action_eligible for finding in findings], [True, False])
         self.assertEqual([finding.severity for finding in findings], [Severity.CRITICAL, Severity.WARNING])
+        exact_finding = next(item for item in findings if item.target_key == "17:123")
+        self.assertEqual(exact_finding.evidence["backend_start"], NOW - timedelta(hours=1))
+        self.assertEqual(exact_finding.evidence["transaction_start"], NOW - timedelta(minutes=6))
+        self.assertEqual(exact_finding.evidence["state_change"], NOW - timedelta(minutes=16))
 
     def test_uses_strict_age_and_excludes_future_system_and_self_sessions(self) -> None:
         at_action_threshold = activity(

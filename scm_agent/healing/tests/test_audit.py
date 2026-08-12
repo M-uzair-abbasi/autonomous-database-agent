@@ -15,11 +15,14 @@ from scm_agent.healing.models import (
     ActionPlan,
     ActionResult,
     ActionStatus,
+    BackendTarget,
     Finding,
+    IndexTarget,
     Mode,
     RuleId,
     Severity,
     TargetKind,
+    TableTarget,
 )
 
 
@@ -49,13 +52,15 @@ def finding(*, fingerprint: str = "dead-tuples:17:42") -> Finding:
 
 
 def plan(*, mode: Mode = Mode.ACT) -> ActionPlan:
+    target = TableTarget(17, 42, "public", "orders")
     return ActionPlan(
         action_kind=ActionKind.VACUUM,
         finding_fingerprint="dead-tuples:17:42",
         target_kind=TargetKind.TABLE,
+        target=target,
         target_key="17:42",
         command="VACUUM (SKIP_LOCKED TRUE, TRUNCATE FALSE) public.orders",
-        parameters={"relation_oid": 42},
+        parameters=target.parameters,
         mode=mode,
         reason="dead tuple pressure",
     )
@@ -343,13 +348,15 @@ class SQLiteAuditRepositoryTests(unittest.TestCase):
             "tables",
         )
         self.repo.record_cycle_transition(cycle_id, "collector_failed", {"dsn": uri, "query": query})
+        target = TableTarget(17, 42, "public", "orders")
         secret_plan = ActionPlan(
             action_kind=ActionKind.VACUUM,
             finding_fingerprint="secret-finding",
             target_kind=TargetKind.TABLE,
+            target=target,
             target_key="17:42",
             command=query,
-            parameters={"connection": conninfo, "query": query},
+            parameters=target.parameters,
             mode=Mode.ACT,
             reason=query,
         )
@@ -405,13 +412,15 @@ class SQLiteAuditRepositoryTests(unittest.TestCase):
             statements["collector"],
         )
         self.repo.record_cycle_transition(cycle_id, statements["cycle_state"], {"ddl": statements["cycle_detail"]})
+        target = TableTarget(17, 42, "public", "orders")
         unsafe_plan = ActionPlan(
             action_kind=ActionKind.VACUUM,
             finding_fingerprint=statements["fingerprint"],
             target_kind=TargetKind.TABLE,
+            target=target,
             target_key=statements["target_key"],
             command=statements["command"],
-            parameters={"ddl": statements["parameters"]},
+            parameters=target.parameters,
             mode=Mode.ACT,
             reason=statements["reason"],
         )
@@ -443,9 +452,10 @@ class SQLiteAuditRepositoryTests(unittest.TestCase):
                 action_kind=ActionKind.VACUUM,
                 finding_fingerprint="dead-tuples:17:42",
                 target_kind=TargetKind.TABLE,
+                target=TableTarget(17, 43, "public", "orders"),
                 target_key="17:43",
                 command="VACUUM FULL public.orders",
-                parameters={},
+                parameters=TableTarget(17, 43, "public", "orders").parameters,
                 mode=Mode.ACT,
                 reason="A plain-language maintenance note.",
             ),
@@ -458,9 +468,10 @@ class SQLiteAuditRepositoryTests(unittest.TestCase):
                 action_kind=ActionKind.REINDEX_INDEX,
                 finding_fingerprint="dead-tuples:17:42",
                 target_kind=TargetKind.INDEX,
+                target=IndexTarget("public", "orders_customer_idx"),
                 target_key="17:44",
                 command="REINDEX INDEX CONCURRENTLY public.orders_customer_idx",
-                parameters={},
+                parameters=IndexTarget("public", "orders_customer_idx").parameters,
                 mode=Mode.ACT,
                 reason="An operator-approved index repair.",
             ),
@@ -472,9 +483,16 @@ class SQLiteAuditRepositoryTests(unittest.TestCase):
                 action_kind=ActionKind.TERMINATE_BACKEND,
                 finding_fingerprint="dead-tuples:17:42",
                 target_kind=TargetKind.BACKEND,
+                target=BackendTarget(
+                    17, 45, NOW - timedelta(hours=1), NOW - timedelta(minutes=30),
+                    NOW - timedelta(minutes=20), "idle in transaction", "scm", "psql",
+                ),
                 target_key="17:45",
                 command="SELECT pg_terminate_backend(?)",
-                parameters={"pid": 45},
+                parameters=BackendTarget(
+                    17, 45, NOW - timedelta(hours=1), NOW - timedelta(minutes=30),
+                    NOW - timedelta(minutes=20), "idle in transaction", "scm", "psql",
+                ).parameters,
                 mode=Mode.ACT,
                 reason="An idle transaction exceeded its action threshold.",
             ),
