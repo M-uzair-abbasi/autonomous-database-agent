@@ -217,12 +217,15 @@ Safety posture:
   explicit opt-in.
 - An anomaly must appear in at least two consecutive completed collections,
   only one action may be dispatched per cycle, and successful vacuum actions
-  have a six-hour target cooldown.
+  have a six-hour target cooldown. A real vacuum with an uncertain outcome is
+  conservatively held by the same cooldown instead of being blindly repeated.
 - Action intent is committed before database dispatch. Typed database, relation,
   and backend identities are revalidated at execution time. Runtime mode and
   feature flags are checked again by the gateway before any database I/O.
 - Plain `VACUUM FULL`, blocking `REINDEX`, and automatic index changes are not
-  permitted. Manual rebuild uses only `REINDEX INDEX CONCURRENTLY`.
+  permitted. Manual rebuild uses only `REINDEX INDEX CONCURRENTLY`; its
+  database, index, and parent-table OIDs are bound during authorization and
+  revalidated before and after the execution lock.
 - The audit journal stores a target hash rather than the DSN, screens free-form
   SQL and credentials, records before/after evidence, and reconciles uncertain
   planned/executing attempts without blindly replaying them.
@@ -237,7 +240,7 @@ Dependency-free verification completed from the repository root:
 
 ```text
 python3 -m unittest discover -s scm_agent/healing/tests -v
-  Ran 170 tests; OK (skipped=5)
+  Ran 185 tests; OK (skipped=5)
 python3 -m compileall -q scm_agent/healing
   exit 0
 python3 -m scm_agent.healing --help
@@ -248,6 +251,10 @@ SCM_HEALING_AUDIT_PATH=<temporary>/audit.sqlite3 \
 git diff --check
   exit 0
 ```
+
+The final independent whole-feature fix re-review returned **Spec PASS** and
+**Quality PASS**, with no remaining Critical or Important blocker in the
+dependency-free implementation.
 
 The five skips are intentional opt-in PostgreSQL live tests. They cover catalog
 collection/observe behavior and disposable `VACUUM`, exact backend termination,
