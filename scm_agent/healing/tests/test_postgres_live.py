@@ -14,14 +14,13 @@ import re
 from urllib.parse import unquote, urlparse
 import unittest
 
-from scm_agent.healing.actions import build_reindex_command, build_vacuum_command
+from scm_agent.healing.actions import ActionPlanner, build_vacuum_command
 from scm_agent.healing.config import HealingConfig, RulePolicy
 from scm_agent.healing.models import (
     ActionKind,
     ActionPlan,
     ActionStatus,
     BackendTarget,
-    IndexTarget,
     Mode,
     TableTarget,
     TargetKind,
@@ -187,25 +186,25 @@ class DisposableActionLiveTests(unittest.TestCase):
     def test_explicit_concurrent_reindex(self) -> None:
         table_name = "scm_ovs_live_reindex"
         index_name = "scm_ovs_live_reindex_idx"
+        action_config = HealingConfig(
+            database_dsn=DSN,
+            mode=Mode.ACT,
+            allow_manual_reindex=True,
+        )
         with self.psycopg.connect(DSN, autocommit=True) as setup:
             try:
                 with setup.cursor() as cursor:
                     cursor.execute(f'DROP TABLE IF EXISTS public."{table_name}"')
                     cursor.execute(f'CREATE TABLE public."{table_name}" (id integer)')
                     cursor.execute(f'CREATE INDEX "{index_name}" ON public."{table_name}" (id)')
-                target = IndexTarget("public", index_name)
-                plan = ActionPlan(
-                    ActionKind.REINDEX_INDEX,
-                    "live-reindex",
-                    TargetKind.INDEX,
-                    target,
-                    "live-reindex",
-                    build_reindex_command("public", index_name),
-                    target.parameters,
-                    Mode.ACT,
-                    "live_test",
+                plan = ActionPlanner().plan_manual_reindex(
+                    "public",
+                    index_name,
+                    action_config,
+                    confirmed=True,
                 )
-                result = self.gateway.execute(plan)
+                gateway = PostgresGateway(action_config)
+                result = gateway.execute(plan)
                 self.assertEqual(result.status, ActionStatus.SUCCEEDED)
             finally:
                 with setup.cursor() as cursor:
