@@ -1,0 +1,37 @@
+# Dedicated PostgreSQL for SCM-OVS.
+#
+# Why its own container rather than reusing the Postgres already on host 5432:
+# that one belongs to an unrelated project, and seeding our demo schema into it
+# would pollute someone else's data. This one is disposable.
+#
+# Host port 5434: 5432 is taken by that unrelated container, and 5433 is already
+# claimed by the burk-scm project's compose file.
+#
+#   Start:    docker compose up -d
+#   Re-seed:  docker compose down -v && docker compose up -d
+#   Stop:     docker compose down
+name: scm-ovs
+
+services:
+  db:
+    image: postgres:16
+    container_name: scm-ovs-db
+    environment:
+      POSTGRES_DB: scm_demo
+      POSTGRES_USER: scm
+      POSTGRES_PASSWORD: scm
+    ports:
+      - "5434:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Files here run automatically the FIRST time the volume is created.
+      # Editing schema.sql later requires `down -v` to take effect.
+      - ./scm_agent/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scm -d scm_demo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
