@@ -58,7 +58,11 @@ INSERT INTO customers (full_name, email, city, country, signup_date) VALUES
     ('Elena Rossi',    'elena.rossi@example.com',    'Milan',     'Italy',         '2024-04-02'),
     ('Farah Nadeem',   'farah.nadeem@example.com',   'Islamabad', 'Pakistan',      '2024-05-19'),
     ('George Miller',  'george.miller@example.com',  'Leeds',     'United Kingdom','2024-06-07'),
-    ('Hina Sohail',    'hina.sohail@example.com',    'Peshawar',  'Pakistan',      '2024-07-25');
+    ('Hina Sohail',    'hina.sohail@example.com',    'Peshawar',  'Pakistan',      '2024-07-25'),
+    -- Deliberately has NO orders. Without a customer like this, a LEFT JOIN and
+    -- an INNER JOIN return identical results, and the evaluation set cannot
+    -- detect a model that confuses the two.
+    ('Imran Shah',     'imran.shah@example.com',     'Quetta',    'Pakistan',      '2024-11-02');
 
 INSERT INTO products (name, category, unit_price, in_stock) VALUES
     ('Mechanical Keyboard',   'Peripherals',  89.99,  42),
@@ -70,7 +74,10 @@ INSERT INTO products (name, category, unit_price, in_stock) VALUES
     ('Laptop Stand',          'Accessories',  39.25,  76),
     ('HD Webcam',             'Peripherals',  64.40,   0),
     ('Ergonomic Chair',       'Furniture',   279.00,   7),
-    ('Desk Lamp',             'Furniture',    32.10,  94);
+    ('Desk Lamp',             'Furniture',    32.10,  94),
+    -- Deliberately never appears in order_items, for the same LEFT JOIN reason
+    -- as Imran Shah above: it makes "products that have never sold" answerable.
+    ('Cable Organiser',       'Accessories',  12.50, 210);
 
 INSERT INTO orders (customer_id, order_date, status) VALUES
     (1, '2024-03-01', 'delivered'),

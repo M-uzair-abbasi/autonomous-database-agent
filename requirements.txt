@@ -1,0 +1,34 @@
+# SCM-OVS dependencies.
+#
+# NOTHING HERE IS INSTALLED YET on the development machine. `pip install` is
+# blocked by PEP 668 (Ubuntu 24.04 externally-managed environment) and
+# `python3.12-venv` is missing, so `python3 -m venv` produces a venv without pip.
+#
+# To set up once you have a terminal that can prompt for a password:
+#
+#     sudo apt install -y python3.12-venv
+#     python3 -m venv .venv
+#     ./.venv/bin/pip install -r requirements.txt
+#
+# Everything built so far runs on the standard library alone and is tested
+# against SQLite, precisely so that this blocker does not stop development.
+
+# --- Database drivers ---
+# PostgreSQL. The [binary] extra ships prebuilt wheels, avoiding a compiler.
+psycopg[binary]>=3.2
+
+# Uncomment when the MySQL / SQL Server introspection paths are actually tested.
+# PyMySQL>=1.1
+# pyodbc>=5.1
+
+# --- Model serving client ---
+# Used only by the openai_compatible provider, which talks to a local vLLM
+# server. Imported lazily so the rest of the system runs without it.
+openai>=1.40
+
+# --- API layer ---
+fastapi>=0.115
+uvicorn[standard]>=0.30
+
+# --- Development / evaluation ---
+pytest>=8.0

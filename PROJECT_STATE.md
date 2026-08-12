@@ -81,8 +81,9 @@ asking the user.
 
 ## 4. File ownership — avoid clobbering each other
 
-This directory has **no version control**, so an overwrite is unrecoverable.
-Stay inside your lane unless the user reassigns it.
+A git repository now exists (Codex ran `git init`), but **all of Pillar 1 is
+still untracked** — `git clean -fd` would delete it. Until the owner commits,
+treat an overwrite as unrecoverable. Stay inside your lane unless reassigned.
 
 | Owner | Paths |
 |---|---|
