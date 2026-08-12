@@ -275,6 +275,33 @@ class PostActionFailingRepository(SQLiteAuditRepository):
         return super().record_cycle_transition(cycle_id, state, detail)
 
 
+class TransientBoundaryRepository(SQLiteAuditRepository):
+    def __init__(
+        self,
+        *args: object,
+        terminal_failures: int = 0,
+        reconcile_failures: int = 0,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.terminal_failures = terminal_failures
+        self.reconcile_failures = reconcile_failures
+        self.reconcile_calls = 0
+
+    def record_action_result(self, action_attempt_id: int, result: ActionResult) -> int:
+        if result.status is not ActionStatus.EXECUTING and self.terminal_failures > 0:
+            self.terminal_failures -= 1
+            raise OSError("transient terminal audit failure")
+        return super().record_action_result(action_attempt_id, result)
+
+    def reconcile_orphans(self) -> list[int]:
+        self.reconcile_calls += 1
+        if self.reconcile_failures > 0:
+            self.reconcile_failures -= 1
+            raise OSError("transient reconciliation failure")
+        return super().reconcile_orphans()
+
+
 class EngineResilienceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -522,7 +549,7 @@ class EngineResilienceTests(unittest.TestCase):
         self.assertEqual(actions[-1]["state"], "outcome_unknown")
         self.assertEqual(action["state"], "succeeded")
 
-    def test_startup_recovers_planned_intent_and_does_not_permanently_block_later_cycle(self) -> None:
+    def test_startup_recovers_planned_intent_before_allowing_a_later_cycle_to_act(self) -> None:
         repository = SQLiteAuditRepository(self.path, clock=self.clock)
         config = self._config()
         target_id = repository.register_target(config.database_dsn, "fixture")
@@ -536,11 +563,12 @@ class EngineResilienceTests(unittest.TestCase):
         gateway = FakeGateway([pressured_snapshot()])
         restarted = HealingEngine(config, gateway, repository, clock=self.clock)
 
-        summary = restarted.run_once()
+        recovery = restarted.run_once()
+        later = restarted.run_once()
 
         actions = repository.list_actions(target_id)
-        self.assertEqual(summary.recovered_orphan_count, 1)
-        self.assertEqual(summary.action_count, 1)
+        self.assertEqual((recovery.recovered_orphan_count, recovery.action_count), (1, 0))
+        self.assertEqual(later.action_count, 1)
         self.assertEqual([action["state"] for action in actions], ["outcome_unknown", "succeeded"])
 
     def test_action_budget_and_priority_choose_one_deterministic_target(self) -> None:
@@ -720,6 +748,16 @@ class FakeMonotonicSleeper:
 
 
 class DaemonLoopTests(unittest.TestCase):
+    @staticmethod
+    def _cycle_states(repository: SQLiteAuditRepository) -> list[str]:
+        with repository._connect() as connection:
+            return [
+                str(row["state"])
+                for row in connection.execute(
+                    "SELECT state FROM cycle_transition ORDER BY id"
+                )
+            ]
+
     def test_run_forever_uses_monotonic_remaining_interval_and_stops_serially(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             path = Path(tempdir) / "audit.sqlite3"
@@ -863,6 +901,65 @@ class DaemonLoopTests(unittest.TestCase):
             self.assertEqual(len(gateway.executed), 1)
             self.assertIn("failed", states)
             self.assertEqual(gateway.read_trace.count("collect"), 3)
+
+    def test_same_daemon_reconciles_transiently_stuck_action_before_any_duplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "audit.sqlite3"
+            clock = MutableClock()
+            repository = TransientBoundaryRepository(
+                path, clock=clock, terminal_failures=2
+            )
+            gateway = FakeGateway([pressured_snapshot()])
+            engine = HealingEngine(
+                HealingConfig(mode=Mode.ACT, audit_path=path),
+                gateway,
+                repository,
+                clock=clock,
+            )
+
+            first = engine.run_once()
+            failed_action_cycle = engine.run_once()
+            recovery_cycle = engine.run_once()
+
+            target_id = repository.list_targets()[0]["id"]
+            actions = repository.list_actions(target_id)
+            self.assertEqual(first.action_count, 0)
+            self.assertEqual(failed_action_cycle.status, "failed")
+            self.assertEqual((recovery_cycle.recovered_orphan_count, recovery_cycle.action_count), (1, 0))
+            self.assertEqual(len(gateway.executed), 1)
+            self.assertEqual([action["state"] for action in actions], ["outcome_unknown"])
+            self.assertEqual(repository.reconcile_calls, 3)
+            self.assertEqual(
+                self._cycle_states(repository),
+                ["started", "completed", "started", "failed", "started", "completed"],
+            )
+
+    def test_transient_reconciliation_failure_fails_closed_then_retries_next_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "audit.sqlite3"
+            repository = TransientBoundaryRepository(
+                path, clock=MutableClock(), reconcile_failures=1
+            )
+            gateway = FakeGateway([HealthSnapshot(observed_at=NOW)])
+            engine = HealingEngine(
+                HealingConfig(mode=Mode.OBSERVE, audit_path=path),
+                gateway,
+                repository,
+                clock=MutableClock(),
+            )
+
+            failed = engine.run_once()
+            recovered = engine.run_once()
+
+            self.assertEqual(failed.status, "failed")
+            self.assertEqual(recovered.status, "completed")
+            self.assertEqual(repository.reconcile_calls, 2)
+            self.assertEqual(gateway.read_trace, ["collect"])
+            self.assertEqual(gateway.executed, [])
+            self.assertEqual(
+                self._cycle_states(repository),
+                ["started", "failed", "started", "completed"],
+            )
 
 
 if __name__ == "__main__":

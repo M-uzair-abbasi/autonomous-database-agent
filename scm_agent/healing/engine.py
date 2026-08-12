@@ -146,15 +146,14 @@ class HealingEngine:
         self._sleeper = sleeper or time.sleep
         self._monotonic = monotonic or time.monotonic
         self._target_id = audit.register_target(config.database_dsn, "scm-ovs-target")
-        self._recovered = False
 
     def run_once(self) -> CycleSummary:
-        recovered = 0
-        if not self._recovered:
-            recovered = len(self._audit.reconcile_orphans())
-            self._recovered = True
-
         cycle_id = self._audit.start_cycle(self._target_id, self._config.mode)
+        try:
+            recovered = len(self._audit.reconcile_orphans())
+        except Exception:
+            self._try_fail_cycle(cycle_id, "orphan_reconciliation_failed")
+            return CycleSummary(status="failed")
         try:
             return self._run_started_cycle(cycle_id, recovered)
         except Exception:
@@ -206,6 +205,9 @@ class HealingEngine:
         action_count = simulated = succeeded = failed = unknown = skipped = 0
         cycle_status = "completed"
         for plan, event_id in planned:
+            if recovered > 0:
+                skipped += len(planned)
+                break
             if action_count >= 1:
                 break
             required_detections = max(2, self._config.required_consecutive_detections)
