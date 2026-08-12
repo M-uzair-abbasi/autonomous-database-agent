@@ -21,6 +21,7 @@ EXIT_OPERATION_FAILED = 1
 EXIT_USAGE = 2
 EXIT_UNAVAILABLE = 3
 EXIT_INTERRUPTED = 130
+_MAX_HISTORY_LIMIT = 100
 
 
 class _SafeArgumentError(ValueError):
@@ -43,6 +44,16 @@ def _add_mode(parser: argparse.ArgumentParser, *, default: str = Mode.OBSERVE.va
     )
 
 
+def _history_limit(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("invalid limit") from error
+    if not 1 <= parsed <= _MAX_HISTORY_LIMIT:
+        raise argparse.ArgumentTypeError("invalid limit")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _SafeArgumentParser(
         prog="python3 -m scm_agent.healing",
@@ -58,8 +69,24 @@ def build_parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="run serial cycles until interrupted")
     _add_mode(run)
 
-    commands.add_parser("events", help="list anomaly events from the local SQLite audit journal")
-    commands.add_parser("actions", help="list action attempts from the local SQLite audit journal")
+    events = commands.add_parser(
+        "events", help="list anomaly events from the local SQLite audit journal"
+    )
+    events.add_argument(
+        "--limit",
+        type=_history_limit,
+        metavar="1..100",
+        help="return at most this many events overall",
+    )
+    actions = commands.add_parser(
+        "actions", help="list action attempts from the local SQLite audit journal"
+    )
+    actions.add_argument(
+        "--limit",
+        type=_history_limit,
+        metavar="1..100",
+        help="return at most this many actions overall",
+    )
 
     reindex = commands.add_parser("reindex", help="request one guarded concurrent index rebuild")
     reindex.add_argument("schema", help="exact user schema name")
@@ -128,12 +155,22 @@ def _engine_factory_default(config: HealingConfig, gateway: object, audit: objec
     return HealingEngine(config, gateway, audit)  # type: ignore[arg-type]
 
 
-def _history(command: str, audit: object) -> dict[str, object]:
+def _history(
+    command: str, audit: object, *, limit: int | None = None
+) -> dict[str, object]:
     listed: list[dict[str, object]] = []
+    remaining = limit
     method_name = "list_events" if command == "events" else "list_actions"
     for target in audit.list_targets():  # type: ignore[attr-defined]
+        if remaining == 0:
+            break
         target_id = int(target["id"])
         items = getattr(audit, method_name)(target_id)
+        if remaining is not None:
+            items = items[:remaining]
+            remaining -= len(items)
+            if not items:
+                continue
         listed.append({"target_id": target_id, "items": items})
     return {"command": command, "targets": listed}
 
@@ -266,7 +303,7 @@ def main(
     try:
         if arguments.command in ("events", "actions"):
             audit = make_audit(config.audit_path)
-            _emit(_history(arguments.command, audit))
+            _emit(_history(arguments.command, audit, limit=arguments.limit))
             return EXIT_OK
 
         if arguments.command == "doctor":

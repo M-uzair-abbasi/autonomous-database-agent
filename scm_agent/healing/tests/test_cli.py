@@ -60,6 +60,35 @@ class _Gateway:
         }
 
 
+class _MultiTargetAudit:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def list_targets(self) -> list[dict[str, object]]:
+        return [{"id": 7}, {"id": 8}]
+
+    def list_events(self, target_id: int) -> list[dict[str, object]]:
+        return {
+            7: [
+                {"id": 11, "target_key": "first"},
+                {"id": 12, "target_key": "second"},
+            ],
+            8: [
+                {"id": 21, "target_key": "third"},
+                {"id": 22, "target_key": "fourth"},
+            ],
+        }[target_id]
+
+    def list_actions(self, target_id: int) -> list[dict[str, object]]:
+        return {
+            7: [
+                {"id": 31, "action_kind": "vacuum"},
+                {"id": 32, "action_kind": "terminate_backend"},
+            ],
+            8: [{"id": 41, "action_kind": "reindex_index"}],
+        }[target_id]
+
+
 class CliTests(unittest.TestCase):
     def run_cli(self, argv: list[str], **dependencies: object) -> tuple[int, str, str]:
         stdout = StringIO()
@@ -161,6 +190,66 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(payload["command"], command)
                 self.assertEqual(payload["targets"][0]["target_id"], 7)
                 self.assertIn(expected_key, payload["targets"][0]["items"][0])
+
+    def test_events_limit_is_global_and_deterministic_without_a_gateway(self) -> None:
+        def forbidden_gateway(config: object) -> object:
+            raise AssertionError("limited history must not construct PostgreSQL gateway")
+
+        code, stdout, stderr = self.run_cli(
+            ["events", "--limit", "1"],
+            audit_factory=_MultiTargetAudit,
+            gateway_factory=forbidden_gateway,
+        )
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(
+            json.loads(stdout),
+            {
+                "command": "events",
+                "targets": [
+                    {"target_id": 7, "items": [{"id": 11, "target_key": "first"}]}
+                ],
+            },
+        )
+
+    def test_actions_limit_uses_the_same_global_bound(self) -> None:
+        def forbidden_gateway(config: object) -> object:
+            raise AssertionError("limited history must not construct PostgreSQL gateway")
+
+        code, stdout, stderr = self.run_cli(
+            ["actions", "--limit", "1"],
+            audit_factory=_MultiTargetAudit,
+            gateway_factory=forbidden_gateway,
+        )
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(
+            json.loads(stdout),
+            {
+                "command": "actions",
+                "targets": [
+                    {"target_id": 7, "items": [{"id": 31, "action_kind": "vacuum"}]}
+                ],
+            },
+        )
+
+    def test_history_limit_rejects_non_positive_excessive_and_non_integer_values(self) -> None:
+        def forbidden_audit(path: Path) -> object:
+            raise AssertionError("invalid limits must fail before opening the audit journal")
+
+        for command in ("events", "actions"):
+            for value in ("0", "-1", "101", "audit-sentinel-password"):
+                with self.subTest(command=command, value=value):
+                    code, stdout, stderr = self.run_cli(
+                        [command, "--limit", value],
+                        audit_factory=forbidden_audit,
+                        gateway_factory=_Gateway,
+                    )
+                    self.assertEqual((code, stdout), (2, ""))
+                    self.assertEqual(
+                        json.loads(stderr),
+                        {"command": "cli", "error": "invalid_arguments"},
+                    )
 
     def test_invalid_mode_is_a_sanitized_usage_error(self) -> None:
         code, stdout, stderr = self.run_cli(

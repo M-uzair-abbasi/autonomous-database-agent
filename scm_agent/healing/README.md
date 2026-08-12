@@ -110,7 +110,13 @@ python3 -m scm_agent.healing run --mode act
 
 `Ctrl-C` stops the daemon cleanly with a JSON interruption result. `events` and
 `actions` read only the local SQLite journal and never instantiate a PostgreSQL
-adapter.
+adapter. Both accept an optional global `--limit` from 1 through 100; the bound
+applies across all targets in the deterministic journal listing order:
+
+```bash
+python3 -m scm_agent.healing events --limit 20
+python3 -m scm_agent.healing actions --limit 20
+```
 
 Manual reindex is always `REINDEX INDEX CONCURRENTLY`. A dry run requires the
 feature flag. A real run requires both the current environment flag and the
