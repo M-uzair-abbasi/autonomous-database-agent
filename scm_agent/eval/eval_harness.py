@@ -62,7 +62,7 @@ The honest bit: cases the *harness* cannot grade
 ------------------------------------------------
 `medium-02` uses `DATE '2024-06-01'`, which is valid PostgreSQL and a syntax
 error in SQLite. No PostgreSQL server is reachable on this machine
-(PROJECT_STATE.md §6), so the **reference** query fails before the model is even
+(docs/TESTING.md), so the **reference** query fails before the model is even
 considered. That is an environment limitation, not a wrong answer, and counting
 it as one would understate every accuracy number we publish.
 
@@ -176,7 +176,7 @@ class Outcome(str, Enum):
     EXECUTION_ERROR = "sql-execution-error"
     """Valid-looking SQL the database rejected: bad column, bad function, wrong
     dialect. For a SQLite-trained base model evaluated on PostgreSQL this is the
-    bucket we *expect* to shrink after fine-tuning (PROJECT_STATE.md §3.4), so
+    bucket we *expect* to shrink after fine-tuning (docs/PROJECT_BRIEF.md), so
     it is the most report-relevant failure of all."""
 
     PIPELINE_ERROR = "pipeline-error"
@@ -548,7 +548,7 @@ def open_evaluation_database(schema_file: Path = DEFAULT_SCHEMA_FILE) -> Fixture
     **This is the one-function swap point for PostgreSQL.** Everything else in
     this module takes a DB-API 2.0 connection and a `Dialect` and does not care
     where they came from. When `docker compose up -d` finally works
-    (PROJECT_STATE.md §7), replace the body with:
+    (docs/TESTING.md), replace the body with:
 
         import psycopg
         return Fixture(psycopg.connect(dsn), Dialect.POSTGRESQL, dsn)

@@ -26,11 +26,11 @@ Two contracts this file must not break
 1.  `OMNISQL_PROMPT_TEMPLATE` below is reproduced verbatim from the OmniSQL
     model card, with one deliberate change: the stock template hardcodes
     `SQLite` as the engine and we substitute `DialectSpec.prompt_name` instead,
-    which is how the project supports four dialects (PROJECT_STATE.md §3.1).
+    which is how the project supports four dialects (docs/PROJECT_BRIEF.md).
     Teammates are generating fine-tuning data against this exact wording. If
     the training format and the inference format drift apart, the fine-tuned
     model quietly gets worse and nothing in the code looks broken — this is
-    "train/serve skew", and PROJECT_STATE.md §5.5 forbids changing the prompt
+    "train/serve skew", and docs/PROJECT_BRIEF.md forbids changing the prompt
     unilaterally once data generation has started.
 
 2.  `answer_question()` never raises. It sits on a web request path, so every
@@ -121,7 +121,7 @@ def build_prompt(question: str, ddl: str, dialect: Dialect) -> str:
     sample values as trailing comments when they were collected.
 
     The engine name comes from `DIALECT_SPECS[dialect].prompt_name`, never from
-    a literal here. PROJECT_STATE.md invariant 2: all dialect facts live in
+    a literal here. docs/ARCHITECTURE.md: all dialect facts live in
     `config.py`, so an unregistered dialect raises `KeyError` right here rather
     than producing a prompt that quietly claims the wrong engine.
     """

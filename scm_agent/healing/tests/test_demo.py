@@ -191,8 +191,47 @@ class DemoRunnerTests(unittest.TestCase):
             [("SELECT pg_catalog.current_database()", None)],
         )
 
-    def test_current_override_still_queries_effective_database_before_mutation(self) -> None:
+    def test_override_refuses_when_effective_database_is_not_the_one_named(self) -> None:
+        """The override permits only the database the DSN actually named.
+
+        Here the DSN claims `scm_ovs_demo_viva` but the connection lands in
+        `production` — a libpq service file, a pooler rewrite, an inherited
+        PGDATABASE. `SCM_HEALING_ALLOW_DEMO=1` used to suppress this runtime
+        check as well as the static one, so a single exported variable removed
+        both guards and the demo would happily build its bloat table in a
+        production database.
+
+        The effective-database query must still be issued first, and nothing
+        may be mutated after the refusal.
+        """
         self.connector = _Connector(database_name="production")
+        runner = DemoRunner(
+            self.config,
+            environ={"SCM_HEALING_ALLOW_DEMO": "1"},
+            connect=self.connector,
+            wait=lambda seconds: None,
+        )
+
+        with self.assertRaises(DemoGuardError):
+            runner.setup_bloat(rows=10)
+
+        statements = self.connector.connections[0].statements
+        self.assertEqual(statements[0], ("SELECT pg_catalog.current_database()", None))
+        self.assertFalse(any("CREATE TABLE" in sql for sql, _ in statements[1:]))
+
+    def test_override_allows_the_non_prefixed_database_the_dsn_named(self) -> None:
+        """The documented workflow still works.
+
+        The project's development database is `scm_demo`, which does not carry
+        the `scm_ovs_demo_` prefix, so the README tells the operator to set
+        SCM_HEALING_ALLOW_DEMO=1. That must keep working — the override is
+        narrowed to an exact match, not removed.
+        """
+        self.config = HealingConfig(
+            database_dsn="postgresql://demo:secret@localhost/scm_demo",
+            audit_path=self.config.audit_path,
+        )
+        self.connector = _Connector(database_name="scm_demo")
         runner = DemoRunner(
             self.config,
             environ={"SCM_HEALING_ALLOW_DEMO": "1"},

@@ -28,7 +28,7 @@ Design rules, in the order they matter:
 4.  **Dialect facts come from `config.DIALECT_SPECS`, never from literals
     here.** MySQL treats `#` as a line comment and the other three engines do
     not, which is exactly the sort of quirk an injection hides behind. That
-    fact lives in `config.py` (PROJECT_STATE.md invariant 2) and is read from
+    fact lives in `config.py` (docs/ARCHITECTURE.md) and is read from
     `line_comment_tokens` / `identifier_quotes` below.
 
 What this module is *not*: a SQL parser. It cannot tell you whether a query is

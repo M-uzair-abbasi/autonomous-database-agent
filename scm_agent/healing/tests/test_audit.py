@@ -9,7 +9,7 @@ import tempfile
 import threading
 import unittest
 
-from scm_agent.healing.audit import SQLiteAuditRepository
+from scm_agent.healing.audit import FAILURE_BACKOFF, SQLiteAuditRepository
 from scm_agent.healing.models import (
     ActionKind,
     ActionPlan,
@@ -421,23 +421,29 @@ class SQLiteAuditRepositoryTests(unittest.TestCase):
 
         self.assertEqual(results, ["cooldown", "cooldown"])
 
-    def test_dry_run_unknown_failed_and_precondition_rejected_do_not_consume_cooldown(self) -> None:
+    def test_dry_run_unknown_and_precondition_rejected_do_not_consume_cooldown(self) -> None:
+        """Cheap outcomes stay non-blocking.
+
+        `precondition_rejected` means the gateway refused before touching the
+        heap — insufficient privilege, stale identity — so an immediate retry
+        costs nothing. A dry-run attempt never executed at all. Neither may
+        consume the real-action cooldown.
+        """
         _, event_id = self._cycle_with_event()
-        for offset, status in enumerate(
-            (ActionStatus.FAILED, ActionStatus.PRECONDITION_REJECTED), start=1
-        ):
-            action = self.repo.acquire_action_intent(
-                event_id, plan(), f"nonblocking-{offset}", None
-            )
-            assert action.action_id is not None
-            self.repo.record_action_result(
-                action.action_id,
-                ActionResult(ActionKind.VACUUM, ActionStatus.EXECUTING, "17:42", NOW),
-            )
-            self.repo.record_action_result(
-                action.action_id,
-                ActionResult(ActionKind.VACUUM, status, "17:42", NOW, NOW),
-            )
+        action = self.repo.acquire_action_intent(
+            event_id, plan(), "nonblocking-rejected", None
+        )
+        assert action.action_id is not None
+        self.repo.record_action_result(
+            action.action_id,
+            ActionResult(ActionKind.VACUUM, ActionStatus.EXECUTING, "17:42", NOW),
+        )
+        self.repo.record_action_result(
+            action.action_id,
+            ActionResult(
+                ActionKind.VACUUM, ActionStatus.PRECONDITION_REJECTED, "17:42", NOW, NOW
+            ),
+        )
         dry = self.repo.acquire_action_intent(
             event_id, plan(mode=Mode.DRY_RUN), "dry-unknown-fixture", None
         )
@@ -451,6 +457,40 @@ class SQLiteAuditRepositoryTests(unittest.TestCase):
             event_id, plan(), "after-nonblocking", timedelta(hours=6)
         )
         self.assertEqual(retry.status, "acquired")
+
+    def test_failed_action_backs_off_briefly_then_becomes_retryable(self) -> None:
+        """A failure blocks for FAILURE_BACKOFF, not for the full cooldown.
+
+        Both ends matter. With no backoff, a VACUUM that hits statement_timeout
+        leaves the anomaly in place and is re-issued every poll_interval (30s)
+        forever, having already paid for a full heap pass each time. With the
+        full six-hour cooldown, a merely transient failure would lock the table
+        out for the rest of the day.
+        """
+        _, event_id = self._cycle_with_event()
+        action = self.repo.acquire_action_intent(event_id, plan(), "failed-once", None)
+        assert action.action_id is not None
+        self.repo.record_action_result(
+            action.action_id,
+            ActionResult(ActionKind.VACUUM, ActionStatus.EXECUTING, "17:42", NOW),
+        )
+        self.repo.record_action_result(
+            action.action_id,
+            ActionResult(ActionKind.VACUUM, ActionStatus.FAILED, "17:42", NOW, NOW),
+        )
+
+        blocked = self.repo.acquire_action_intent(
+            event_id, plan(), "failed-immediate-retry", timedelta(hours=6)
+        )
+        self.assertEqual(blocked.status, "cooldown")
+        self.assertEqual(blocked.cooldown_until, NOW + FAILURE_BACKOFF)
+        self.assertLess(FAILURE_BACKOFF, timedelta(hours=6))
+
+        self.repo.clock.value = NOW + FAILURE_BACKOFF
+        allowed = self.repo.acquire_action_intent(
+            event_id, plan(), "failed-after-backoff", timedelta(hours=6)
+        )
+        self.assertEqual(allowed.status, "acquired")
 
     def test_dry_run_cannot_transition_to_execution_or_success(self) -> None:
         _, event_id = self._cycle_with_event()

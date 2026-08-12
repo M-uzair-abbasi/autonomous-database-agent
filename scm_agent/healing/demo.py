@@ -44,7 +44,14 @@ _UPDATE_BLOAT_SQL = f"""
 UPDATE \"{BLOAT_TABLE}\"
 SET payload = payload || 'y', touched_at = pg_catalog.clock_timestamp()
 """
-_DELETE_BLOAT_SQL = f'DELETE FROM "{BLOAT_TABLE}" WHERE (id %% 4) <> 0'
+# Uses mod() rather than the `%` operator on purpose. Psycopg only unescapes
+# `%%` when parameters are passed, and this statement is executed with none
+# (see setup_bloat below) — so `%%` reached the server literally and failed with
+# "operator does not exist: bigint %% integer", aborting `demo bloat setup`
+# after the earlier statements had already committed. A single `%` would work
+# today but only while this call stays parameterless; mod() is correct either
+# way and cannot regress if a parameter is added later.
+_DELETE_BLOAT_SQL = f'DELETE FROM "{BLOAT_TABLE}" WHERE pg_catalog.mod(id, 4) <> 0'
 _DROP_BLOAT_SQL = f'DROP TABLE IF EXISTS "{BLOAT_TABLE}"'
 
 _TERMINATE_EXACT_TAG_SQL = """
@@ -191,11 +198,20 @@ class DemoRunner:
                 or not isinstance(row[0], str)
             ):
                 raise DemoGuardError("demo refused: effective database could not be verified")
-            if (
-                self._environ.get("SCM_HEALING_ALLOW_DEMO") != "1"
-                and not row[0].startswith(DEMO_PREFIX)
-            ):
-                raise DemoGuardError("demo refused: effective database is not disposable")
+            effective = row[0]
+            if not effective.startswith(DEMO_PREFIX):
+                # SCM_HEALING_ALLOW_DEMO=1 previously disabled this runtime check
+                # as well as the static one in ensure_disposable_target, so a
+                # single exported variable removed both guards at once. It now
+                # only permits the database the DSN actually named: if the
+                # connection lands somewhere else — a libpq service file, a
+                # pooler rewrite, an inherited PGDATABASE — this still refuses.
+                claimed = _database_name(self._config.database_dsn)
+                overridden = self._environ.get("SCM_HEALING_ALLOW_DEMO") == "1"
+                if not (overridden and claimed is not None and effective == claimed):
+                    raise DemoGuardError(
+                        "demo refused: effective database is not disposable"
+                    )
             if not autocommit:
                 connection.rollback()
             return connection

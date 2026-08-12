@@ -21,6 +21,17 @@ from .models import ActionKind, ActionPlan, ActionResult, Finding, Mode
 
 
 Clock = Callable[[], datetime]
+# Backoff applied after a FAILED action, as distinct from the much longer
+# cooldown that follows a successful one (HealingConfig.vacuum_cooldown, >= 6h).
+#
+# Deliberately short: a failure is often transient (lock contention, a timeout
+# on a table that has since shrunk) and should be retryable well before six
+# hours. But it must not be zero — an action that failed on statement_timeout
+# has already paid for a full heap pass, and with no backoff at all the engine
+# re-issues it every poll_interval (30s by default) for as long as the anomaly
+# persists.
+FAILURE_BACKOFF = timedelta(minutes=15)
+
 _DSN_PATTERN = re.compile(r"(?:[a-z][a-z0-9+.-]*://)\S+", re.IGNORECASE)
 _CONNINFO_PATTERN = re.compile(r"\b(?:host|hostaddr|port|dbname|user|username|password|pass|pwd)\s*=", re.IGNORECASE)
 _COMMAND_TOKEN_PATTERN = re.compile(
@@ -487,7 +498,7 @@ class SQLiteAuditRepository:
                     return ActionIntentAcquisition("duplicate")
                 if cooldown is not None:
                     terminal = connection.execute(
-                        """SELECT transition.occurred_at FROM action_transition AS transition
+                        """SELECT transition.occurred_at, transition.state FROM action_transition AS transition
                            JOIN action_attempt AS attempt ON attempt.id = transition.action_attempt_id
                            JOIN anomaly_event AS prior_event ON prior_event.id = attempt.event_id
                            WHERE prior_event.target_id = ? AND attempt.action_kind = ? AND attempt.target_key = ?
@@ -501,12 +512,30 @@ class SQLiteAuditRepository:
                                    )
                                  ORDER BY latest.id DESC LIMIT 1
                              )
-                             AND transition.state IN ('succeeded', 'outcome_unknown')
+                             AND transition.state IN ('succeeded', 'outcome_unknown', 'failed')
                            ORDER BY transition.occurred_at DESC, transition.id DESC LIMIT 1""",
                         (event["target_id"], item.action_kind.value, _sanitize_text(item.target_key, "target_key")),
                     ).fetchone()
                     if terminal is not None:
-                        cooldown_until = datetime.fromisoformat(str(terminal["occurred_at"])) + cooldown
+                        # A failure gets a short backoff, not the full success
+                        # cooldown. Without any backoff, a VACUUM that hits
+                        # statement_timeout (60s default) leaves the anomaly in
+                        # place, _idempotency_key mints a fresh key from
+                        # cycle_id, and the same expensive VACUUM is re-issued
+                        # every poll_interval (30s) forever — the self-inflicted
+                        # DoS the safety spec warns about. But charging a failure
+                        # the full six hours would be wrong too: a transient
+                        # failure should be retryable soon. Hence two windows.
+                        #
+                        # 'precondition_rejected' still blocks nothing: those are
+                        # cheap (insufficient privilege, stale identity) and
+                        # never touch the heap, so immediate retry is correct.
+                        window = (
+                            FAILURE_BACKOFF
+                            if str(terminal["state"]) == "failed"
+                            else cooldown
+                        )
+                        cooldown_until = datetime.fromisoformat(str(terminal["occurred_at"])) + window
                         if self.clock() < cooldown_until:
                             connection.commit()
                             return ActionIntentAcquisition("cooldown", cooldown_until=cooldown_until)

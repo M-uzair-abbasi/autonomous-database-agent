@@ -16,7 +16,7 @@ comments. Sample values matter more than they look: they teach the model that
 `status` holds 'delivered' rather than 'DELIVERED', which is a common source of
 otherwise-perfect queries returning zero rows.
 
-Verification status of each dialect (see PROJECT_STATE.md):
+Verification status of each dialect (see docs/TESTING.md):
 
     sqlite      -- verified, exercised by the self-test at the bottom
     postgresql  -- implemented; verify once the 5434 container is running

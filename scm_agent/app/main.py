@@ -15,7 +15,7 @@ once as a three-line FastAPI route that calls it. FastAPI is imported lazily,
 so importing this module on a machine without FastAPI still gives you the
 plain functions.
 
-Environment note (verified 2026-08-12, and it contradicts PROJECT_STATE.md §6):
+Environment note (verified 2026-08-12, and it contradicts docs/TESTING.md):
 `fastapi` 0.135.1, `uvicorn` 0.41.0 and `pydantic` 2.12.5 **are** present in
 `~/.local/lib/python3.12/site-packages`, so the server really can be started on
 this machine. `psycopg` and `openai` are still genuinely absent, so the
@@ -67,11 +67,10 @@ Running it, once FastAPI is installed
          -H 'Content-Type: application/json' \\
          -d '{"question": "How many customers are there?"}'
 
-Ownership note: PROJECT_STATE.md §4 lists `app/main.py` as a shared
-integration point that should be announced before editing. This file was
-created by Claude Code on 2026-08-12; the healing engine (Codex/GPT, Pillar 2)
-will need to add its own routes here later, and nothing in this module touches
-`scm_agent/healing/**`.
+This module is the integration point between the two subsystems. It currently
+exposes the query pipeline only; the self-healing engine will add its own routes
+here later. Nothing in this module imports from `scm_agent/healing/**`, so the
+two remain independent until that happens.
 """
 
 from __future__ import annotations
@@ -215,7 +214,7 @@ def open_connection(config: AppConfig | None = None, read_only: bool = True):
         return _connect_postgresql(dsn, read_only=read_only)
 
     # MySQL and SQL Server are in scope for the NL->SQL *prompt* path
-    # (PROJECT_STATE.md §3.1) and `schema_context.py` has introspection code
+    # (docs/PROJECT_BRIEF.md) and `schema_context.py` has introspection code
     # for both, but no driver is pinned in requirements.txt yet and neither has
     # ever been run against a real server. Saying so is better than importing a
     # package that was never chosen.
@@ -268,7 +267,7 @@ def _connect_postgresql(dsn: str, read_only: bool):
         # Session-level read-only: PostgreSQL itself then rejects any write,
         # whatever the rest of the stack does. Best-effort and wrapped, because
         # NO PostgreSQL SERVER HAS BEEN REACHABLE ON THIS MACHINE — this line
-        # has never actually run (PROJECT_STATE.md "Verification honesty").
+        # has never actually run (docs/TESTING.md).
         # A failure here must not cost us a working connection.
         try:
             conn.read_only = True
@@ -325,7 +324,7 @@ def database_connection(
 
 
 # --------------------------------------------------------------------------
-# 2. Never leak the DSN (PROJECT_STATE.md invariant 3)
+# 2. Never leak the DSN (docs/ARCHITECTURE.md)
 # --------------------------------------------------------------------------
 
 _KEYVALUE_SECRET = re.compile(r"password\s*=\s*([^\s]+)", re.IGNORECASE)
@@ -433,7 +432,7 @@ def health_endpoint(
     """`GET /health` — what model are we on, and is the database alive?
 
     The payload is `AppConfig.summary()` (which already excludes the DSN — that
-    exclusion is a tested invariant, PROJECT_STATE.md §5.3) plus three fields:
+    exclusion is a tested invariant, docs/ARCHITECTURE.md) plus three fields:
 
         status              "ok" or "degraded"
         database_reachable  did a `SELECT 1` succeed?

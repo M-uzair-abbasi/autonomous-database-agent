@@ -106,6 +106,26 @@ def _nonempty_text(value: str, field_name: str) -> None:
         raise ValueError(f"{field_name} must not contain NUL")
 
 
+def _possibly_empty_text(value: str, field_name: str) -> None:
+    """Validate a field that PostgreSQL legitimately reports as an empty string.
+
+    `application_name` is empty for any client that never sets it, which is the
+    libpq default — so a plain psycopg script holding a transaction open reports
+    ''. Requiring it to be non-empty made `_backend_target` raise,
+    `ActionPlanner.plan` swallow the ValueError, and termination silently never
+    happen for exactly the sessions the idle-in-transaction demo creates.
+
+    Empty is safe here: `TERMINATE_BACKEND_SQL` matches `application_name = %s`
+    as one of eight identity predicates, and '' matches '' exactly. The healer's
+    own self-protection (`application_name <> 'scm-ovs/healer'`) is unaffected,
+    since '' is not that literal.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    if "\x00" in value:
+        raise ValueError(f"{field_name} must not contain NUL")
+
+
 @dataclass(frozen=True)
 class TableTarget:
     """The stable catalog identity required to vacuum one user table."""
@@ -154,7 +174,8 @@ class BackendTarget:
             _require_aware(value, name)
         _nonempty_text(self.state, "state")
         _nonempty_text(self.role_name, "role_name")
-        _nonempty_text(self.application_name, "application_name")
+        # Empty is valid and common — see _possibly_empty_text.
+        _possibly_empty_text(self.application_name, "application_name")
 
     @property
     def parameters(self) -> FrozenMapping:

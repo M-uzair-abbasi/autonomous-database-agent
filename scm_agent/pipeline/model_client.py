@@ -362,7 +362,7 @@ class OpenAICompatibleClient:
         # message and no system message. That is how the model card uses it, and
         # the prompt already carries its own task description — adding a system
         # prompt here would make inference differ from the format the training
-        # data is generated in (train/serve skew), which PROJECT_STATE.md §5.5
+        # data is generated in (train/serve skew), which docs/PROJECT_BRIEF.md
         # explicitly forbids.
         try:
             response = self._client.chat.completions.create(
