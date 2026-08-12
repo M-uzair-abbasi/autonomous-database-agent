@@ -1,7 +1,7 @@
 # SCM-OVS Self-Healing Engine Design
 
-**Date:** 2026-08-12  
-**Owner:** Codex / GPT (`scm_agent/healing/**`)  
+**Date:** 2026-08-12
+**Owner:** Codex / GPT (`scm_agent/healing/**`)
 **Status:** Approved for implementation by the project owner’s instruction to let the agent council decide and build the complete healing lane for later review.
 
 ## 1. Goal and boundaries

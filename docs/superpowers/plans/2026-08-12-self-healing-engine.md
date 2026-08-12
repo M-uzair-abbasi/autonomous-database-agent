@@ -471,4 +471,3 @@ git commit -m "docs: record healing engine verification state"
 - [ ] **Step 5: Request final whole-feature review**
 
 Provide the design, this plan, full diff from the baseline, verification output, and any deferred findings to a fresh high-capability reviewer. Fix all critical/important findings through one reviewed fix wave, rerun Step 1, and preserve residual non-blocking rulings in the development ledger.
-
