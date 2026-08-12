@@ -23,8 +23,36 @@ from .models import ActionKind, ActionPlan, ActionResult, Finding, Mode
 Clock = Callable[[], datetime]
 _DSN_PATTERN = re.compile(r"(?:[a-z][a-z0-9+.-]*://)\S+", re.IGNORECASE)
 _CONNINFO_PATTERN = re.compile(r"\b(?:host|hostaddr|port|dbname|user|username|password|pass|pwd)\s*=", re.IGNORECASE)
-_QUERY_PATTERN = re.compile(r"\b(?:select|insert|update|delete|with|merge|copy)\b", re.IGNORECASE)
-_TERMINATE_COMMAND = re.compile(r"select\s+pg_terminate_backend\s*\([^;]*\)\s*", re.IGNORECASE)
+_SQL_STATEMENT_PATTERN = re.compile(
+    r"""(?ix)
+    \b(?:
+        select\b | insert\s+into\b | update\s+(?:only\s+)?(?:\"|[a-z_]) |
+        delete\s+from\b | with\s+(?:recursive\s+)?(?:\"|[a-z_]) | merge\s+into\b | copy\s+(?:\"|[a-z_]) |
+        alter\s+(?:role|user|group|table|index|database|schema|function|procedure|routine|sequence|type|view|domain|extension|system)\b |
+        create\s+(?:role|user|group|table|index|database|schema|function|procedure|sequence|type|view|extension|policy|trigger)\b |
+        drop\s+(?:role|user|group|table|index|database|schema|function|procedure|sequence|type|view|extension|owned)\b |
+        grant\s+(?:all\b|[a-z_]) | revoke\s+(?:all\b|[a-z_]) | comment\s+on\b | truncate\s+(?:table\s+)?(?:\"|[a-z_]) |
+        vacuum\s+(?:full\b|\(|(?:\"|[a-z_])) | reindex\s+(?:index\b|table\b|database\b|system\b|\"|[a-z_]) |
+        analyze\s+(?:verbose\s+)?(?:\"|[a-z_]) | cluster\s+(?:\"|[a-z_]) | lock\s+table\b |
+        explain\s+(?:analyze\s+)?(?:select\b|insert\b|update\b|delete\b) | call\s+(?:\"|[a-z_]) |
+        do\s+\$ | execute\s+(?:\"|[a-z_]) | prepare\s+(?:\"|[a-z_]) |
+        begin\b | commit\b | rollback\b | savepoint\b | release\s+savepoint\b |
+        declare\s+(?:\"|[a-z_]) | fetch\s+(?:forward\s+|backward\s+)?(?:\d+\s+)?from\b |
+        listen\s+(?:\"|[a-z_]) | notify\s+(?:\"|[a-z_]) | checkpoint\b |
+        refresh\s+materialized\s+view\b
+    )
+    """
+)
+_IDENTIFIER = r'(?:[a-z_][a-z0-9_$]*|"(?:[^"]|"")+")'
+_QUALIFIED_IDENTIFIER = rf"{_IDENTIFIER}\.{_IDENTIFIER}"
+_VACUUM_COMMAND = re.compile(
+    rf"vacuum\s+\(\s*skip_locked\s+true\s*,\s*truncate\s+false\s*\)\s+{_QUALIFIED_IDENTIFIER}",
+    re.IGNORECASE,
+)
+_REINDEX_COMMAND = re.compile(
+    rf"reindex\s+index\s+concurrently\s+{_QUALIFIED_IDENTIFIER}", re.IGNORECASE
+)
+_TERMINATE_COMMAND = re.compile(r"select\s+pg_terminate_backend\s*\(\s*\?\s*\)", re.IGNORECASE)
 _SAFE_LABEL = re.compile(r"[^a-zA-Z0-9._ -]+")
 _MAX_ERROR_LENGTH = 500
 
@@ -49,12 +77,10 @@ def _iso(value: datetime) -> str:
 
 
 def _is_safe_healing_command(value: str) -> bool:
-    normalized = value.strip().lower()
-    return (
-        (normalized.startswith("vacuum") and ";" not in normalized)
-        or (normalized.startswith("reindex") and ";" not in normalized)
-        or _TERMINATE_COMMAND.fullmatch(normalized) is not None
-    )
+    normalized = value.strip()
+    return any(pattern.fullmatch(normalized) is not None for pattern in (
+        _VACUUM_COMMAND, _REINDEX_COMMAND, _TERMINATE_COMMAND,
+    ))
 
 
 def _sanitize_text(value: str, key: str | None = None) -> str:
@@ -65,7 +91,9 @@ def _sanitize_text(value: str, key: str | None = None) -> str:
     if _CONNINFO_PATTERN.search(value):
         return "[redacted-conninfo]"
     without_uri = _DSN_PATTERN.sub("[redacted-dsn]", value)
-    if _QUERY_PATTERN.search(without_uri) and not _is_safe_healing_command(without_uri):
+    if normalized_key == "command" and _is_safe_healing_command(without_uri):
+        return without_uri.replace("\x00", " ")[:_MAX_ERROR_LENGTH]
+    if _SQL_STATEMENT_PATTERN.search(without_uri):
         return "[redacted-query]"
     return without_uri.replace("\x00", " ")[:_MAX_ERROR_LENGTH]
 
@@ -99,7 +127,7 @@ def _sanitize_label(value: str, target_hash: str) -> str:
     without_dsn = _DSN_PATTERN.sub("", value).strip(" -:/")
     if _CONNINFO_PATTERN.search(without_dsn):
         without_dsn = ""
-    if _QUERY_PATTERN.search(without_dsn):
+    if _SQL_STATEMENT_PATTERN.search(without_dsn):
         without_dsn = ""
     cleaned = _SAFE_LABEL.sub("", without_dsn).strip()
     return (cleaned[:120] or f"target-{target_hash[:12]}")

@@ -54,7 +54,7 @@ def plan(*, mode: Mode = Mode.ACT) -> ActionPlan:
         finding_fingerprint="dead-tuples:17:42",
         target_kind=TargetKind.TABLE,
         target_key="17:42",
-        command="VACUUM (ANALYZE) public.orders",
+        command="VACUUM (SKIP_LOCKED TRUE, TRUNCATE FALSE) public.orders",
         parameters={"relation_oid": 42},
         mode=mode,
         reason="dead tuple pressure",
@@ -366,6 +366,144 @@ class SQLiteAuditRepositoryTests(unittest.TestCase):
         )
         for secret in (b"supersecret", b"hidden.example", b"SELECT credit_card", b"alice"):
             self.assertNotIn(secret, stored)
+
+    def test_ddl_security_and_maintenance_sql_never_persist_in_free_form_fields(self) -> None:
+        statements = {
+            "label": "ALTER ROLE alice PASSWORD 'sentinel-secret'",
+            "cycle_state": "CREATE TABLE confidential (secret text)",
+            "cycle_detail": "DROP TABLE confidential",
+            "fingerprint": "GRANT ALL ON confidential TO alice",
+            "rule_version": "REVOKE ALL ON confidential FROM alice",
+            "target_key": "COMMENT ON TABLE confidential IS 'sentinel-secret'",
+            "collector": "TRUNCATE confidential",
+            "evidence": "VACUUM FULL confidential",
+            "recommendation": "REINDEX confidential_idx",
+            "command": "ALTER ROLE alice PASSWORD 'sentinel-secret'",
+            "parameters": "CREATE ROLE intruder LOGIN PASSWORD 'sentinel-secret'",
+            "reason": "DROP OWNED BY alice",
+            "idempotency": "GRANT ALL ON confidential TO alice",
+            "error": "REVOKE ALL ON confidential FROM alice",
+            "result_evidence": "COMMENT ON TABLE confidential IS 'sentinel-secret'",
+            "snapshot": "TRUNCATE confidential",
+        }
+        self.repo.register_target("postgresql://scm:other@db.example:5434/other", statements["label"])
+        cycle_id = self.repo.start_cycle(self.target_id, Mode.ACT)
+        event_id = self.repo.record_finding(
+            cycle_id,
+            Finding(
+                rule_id=RuleId.DEAD_TUPLE_PRESSURE,
+                severity=Severity.WARNING,
+                target_kind=TargetKind.TABLE,
+                target_key=statements["target_key"],
+                evidence={"ddl": statements["evidence"]},
+                recommendation=statements["recommendation"],
+                action_eligible=True,
+                observed_at=NOW,
+                fingerprint=statements["fingerprint"],
+                rule_version=statements["rule_version"],
+            ),
+            statements["collector"],
+        )
+        self.repo.record_cycle_transition(cycle_id, statements["cycle_state"], {"ddl": statements["cycle_detail"]})
+        unsafe_plan = ActionPlan(
+            action_kind=ActionKind.VACUUM,
+            finding_fingerprint=statements["fingerprint"],
+            target_kind=TargetKind.TABLE,
+            target_key=statements["target_key"],
+            command=statements["command"],
+            parameters={"ddl": statements["parameters"]},
+            mode=Mode.ACT,
+            reason=statements["reason"],
+        )
+        action_id = self.repo.record_action_intent(event_id, unsafe_plan, statements["idempotency"])
+        assert action_id is not None
+        self.repo.record_action_result(
+            action_id,
+            ActionResult(
+                ActionKind.VACUUM, ActionStatus.EXECUTING, statements["target_key"], NOW,
+                error=statements["error"], evidence={"ddl": statements["result_evidence"]},
+            ),
+        )
+        self.repo.record_snapshot(action_id, "before", {"ddl": statements["snapshot"]})
+
+        stored = b"".join(
+            candidate.read_bytes() for candidate in (self.path, Path(f"{self.path}-wal")) if candidate.exists()
+        )
+        for statement in statements.values():
+            self.assertNotIn(statement.encode(), stored)
+        self.assertNotIn(b"sentinel-secret", stored)
+
+    def test_only_canonical_healing_commands_are_retained(self) -> None:
+        _, event_id = self._cycle_with_event()
+        canonical = self.repo.record_action_intent(event_id, plan(), "canonical-command")
+        assert canonical is not None
+        unsafe = self.repo.record_action_intent(
+            event_id,
+            ActionPlan(
+                action_kind=ActionKind.VACUUM,
+                finding_fingerprint="dead-tuples:17:42",
+                target_kind=TargetKind.TABLE,
+                target_key="17:43",
+                command="VACUUM FULL public.orders",
+                parameters={},
+                mode=Mode.ACT,
+                reason="A plain-language maintenance note.",
+            ),
+            "unsafe-command",
+        )
+        assert unsafe is not None
+        reindex = self.repo.record_action_intent(
+            event_id,
+            ActionPlan(
+                action_kind=ActionKind.REINDEX_INDEX,
+                finding_fingerprint="dead-tuples:17:42",
+                target_kind=TargetKind.INDEX,
+                target_key="17:44",
+                command="REINDEX INDEX CONCURRENTLY public.orders_customer_idx",
+                parameters={},
+                mode=Mode.ACT,
+                reason="An operator-approved index repair.",
+            ),
+            "canonical-reindex",
+        )
+        terminate = self.repo.record_action_intent(
+            event_id,
+            ActionPlan(
+                action_kind=ActionKind.TERMINATE_BACKEND,
+                finding_fingerprint="dead-tuples:17:42",
+                target_kind=TargetKind.BACKEND,
+                target_key="17:45",
+                command="SELECT pg_terminate_backend(?)",
+                parameters={"pid": 45},
+                mode=Mode.ACT,
+                reason="An idle transaction exceeded its action threshold.",
+            ),
+            "canonical-terminate",
+        )
+        assert reindex is not None
+        assert terminate is not None
+
+        commands = [action["command"] for action in self.repo.list_actions(self.target_id)]
+        self.assertEqual(commands[0], "VACUUM (SKIP_LOCKED TRUE, TRUNCATE FALSE) public.orders")
+        self.assertEqual(commands[1], "[redacted-query]")
+        self.assertEqual(commands[2], "REINDEX INDEX CONCURRENTLY public.orders_customer_idx")
+        self.assertEqual(commands[3], "SELECT pg_terminate_backend(?)")
+        self.assertEqual(
+            self.repo.list_actions(self.target_id)[1]["transitions"][0]["detail_json"],
+            "{}",
+        )
+
+    def test_non_sql_human_explanations_remain_usable(self) -> None:
+        explanation = "Maintenance was deferred because the operator is reviewing the lock window."
+        cycle_id = self.repo.start_cycle(self.target_id, Mode.OBSERVE)
+        self.repo.record_cycle_transition(cycle_id, "operator_note", {"explanation": explanation})
+
+        with sqlite3.connect(self.path) as connection:
+            stored = connection.execute(
+                "SELECT detail_json FROM cycle_transition WHERE cycle_id = ? ORDER BY id DESC LIMIT 1",
+                (cycle_id,),
+            ).fetchone()[0]
+        self.assertEqual(stored, '{"explanation":"Maintenance was deferred because the operator is reviewing the lock window."}')
 
 
 if __name__ == "__main__":
