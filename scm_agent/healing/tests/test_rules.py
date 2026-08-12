@@ -79,6 +79,19 @@ def index(**changes: object) -> IndexStatsSample:
 
 
 class TablePressureTests(unittest.TestCase):
+    def test_minimum_table_rows_boundary_is_strict(self) -> None:
+        policy = RulePolicy()
+        below_minimum_rows = table(live=4_998, dead=5_001)
+        equal_minimum_rows = table(live=4_999, dead=5_001)
+        above_minimum_rows = table(live=5_000, dead=5_001)
+
+        self.assertEqual(detect_table_pressure((below_minimum_rows,), policy), ())
+        self.assertEqual(detect_table_pressure((equal_minimum_rows,), policy), ())
+        self.assertEqual(
+            len(detect_table_pressure((above_minimum_rows,), policy)),
+            1,
+        )
+
     def test_requires_all_strict_thresholds_and_safe_denominator(self) -> None:
         policy = RulePolicy()
         at_ratio = table(live=20_000, dead=5_000)
@@ -102,6 +115,21 @@ class TablePressureTests(unittest.TestCase):
 
 
 class IdleTransactionTests(unittest.TestCase):
+    def test_idle_transaction_warning_boundary_is_strict(self) -> None:
+        policy = RulePolicy()
+        below_warning = activity(
+            state="idle in transaction",
+            state_change=NOW - timedelta(minutes=4),
+        )
+        equal_warning = activity(
+            pid=124,
+            state="idle in transaction",
+            state_change=NOW - timedelta(minutes=5),
+        )
+
+        self.assertEqual(detect_idle_transactions((below_warning,), policy), ())
+        self.assertEqual(detect_idle_transactions((equal_warning,), policy), ())
+
     def test_warns_for_both_idle_transaction_states_but_only_exact_state_can_act(self) -> None:
         policy = RulePolicy()
         exact_old = activity(state="idle in transaction", state_change=NOW - timedelta(minutes=16))
@@ -130,6 +158,16 @@ class IdleTransactionTests(unittest.TestCase):
 
 
 class LongQueryTests(unittest.TestCase):
+    def test_long_query_boundary_and_missing_start_do_not_fire(self) -> None:
+        policy = RulePolicy()
+        below_threshold = activity(query_start=NOW - timedelta(minutes=4))
+        equal_threshold = activity(pid=124, query_start=NOW - timedelta(minutes=5))
+        missing_start = activity(pid=125, query_start=None)
+
+        self.assertEqual(detect_long_queries((below_threshold,), policy), ())
+        self.assertEqual(detect_long_queries((equal_threshold,), policy), ())
+        self.assertEqual(detect_long_queries((missing_start,), policy), ())
+
     def test_only_active_old_queries_are_advisory_and_query_text_is_absent(self) -> None:
         old_active = activity(query_start=NOW - timedelta(minutes=6))
         idle = activity(pid=124, state="idle", query_start=NOW - timedelta(minutes=6))
@@ -146,6 +184,14 @@ class LongQueryTests(unittest.TestCase):
 
 
 class ConnectionSaturationTests(unittest.TestCase):
+    def test_connection_critical_equality_remains_warning(self) -> None:
+        policy = RulePolicy()
+        exactly_critical = ConnectionSample(NOW, client_backend_count=90, maximum_connections=100)
+
+        finding = detect_connection_saturation(exactly_critical, policy)[0]
+
+        self.assertEqual(finding.severity, Severity.WARNING)
+
     def test_uses_warning_and_critical_bands_with_strict_boundaries(self) -> None:
         policy = RulePolicy()
         equal_warning = ConnectionSample(NOW, client_backend_count=80, maximum_connections=100)
@@ -163,6 +209,17 @@ class ConnectionSaturationTests(unittest.TestCase):
 
 
 class UnusedIndexTests(unittest.TestCase):
+    def test_statistics_age_equality_and_scans_above_maximum_do_not_fire(self) -> None:
+        policy = RulePolicy()
+        exactly_minimum_age = index(
+            stats_reset=NOW - timedelta(days=7),
+            server_started=NOW - timedelta(days=30),
+        )
+        scans_above_maximum = index(index_oid=100, idx_scan=1)
+
+        self.assertEqual(detect_unused_indexes((exactly_minimum_age,), policy), ())
+        self.assertEqual(detect_unused_indexes((scans_above_maximum,), policy), ())
+
     def test_requires_large_unused_index_with_trustworthy_statistics(self) -> None:
         policy = RulePolicy()
         eligible = index()

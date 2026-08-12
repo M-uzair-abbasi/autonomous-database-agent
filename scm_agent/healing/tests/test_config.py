@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import os
 import unittest
+from unittest.mock import patch
 
 from scm_agent.healing.config import HealingConfig, RulePolicy
 from scm_agent.healing.models import Mode
@@ -101,6 +103,31 @@ class HealingConfigFromEnvironmentTests(unittest.TestCase):
         self.assertNotIn("database_dsn", summary)
         self.assertNotIn("top-secret", repr(summary))
         self.assertEqual(summary["mode"], "observe")
+
+    def test_secret_dsn_is_absent_from_config_repr_and_safe_summary(self) -> None:
+        config = HealingConfig.from_env(
+            {"SCM_DB_DSN": "postgresql://operator:repr-regression-secret@db.example/healing"}
+        )
+
+        self.assertNotIn("repr-regression-secret", repr(config))
+        self.assertNotIn("repr-regression-secret", repr(config.safe_summary()))
+
+    def test_from_env_without_mapping_reads_process_environment(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "SCM_HEALING_MODE": "dry_run",
+                "SCM_DB_DSN": "postgresql://scm:environment-secret@localhost:5434/scm_demo",
+            },
+            clear=True,
+        ):
+            config = HealingConfig.from_env()
+
+        self.assertIs(config.mode, Mode.DRY_RUN)
+        self.assertEqual(
+            config.database_dsn,
+            "postgresql://scm:environment-secret@localhost:5434/scm_demo",
+        )
 
 
 if __name__ == "__main__":

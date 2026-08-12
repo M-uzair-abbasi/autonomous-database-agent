@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import timedelta
+import os
 from pathlib import Path
 from typing import Mapping
 
@@ -99,7 +100,7 @@ class RulePolicy:
 
 @dataclass(frozen=True)
 class HealingConfig:
-    database_dsn: str = _DEFAULT_DSN
+    database_dsn: str = field(default=_DEFAULT_DSN, repr=False)
     mode: Mode = Mode.OBSERVE
     policy: RulePolicy = field(default_factory=RulePolicy)
     audit_path: Path = Path("var/scm_ovs/healing-audit.sqlite3")
@@ -132,7 +133,7 @@ class HealingConfig:
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "HealingConfig":
-        values: Mapping[str, str] = {} if environ is None else environ
+        values: Mapping[str, str] = os.environ if environ is None else environ
         raw_mode = values.get("SCM_HEALING_MODE", Mode.OBSERVE.value).strip().lower()
         try:
             mode = Mode(raw_mode)
