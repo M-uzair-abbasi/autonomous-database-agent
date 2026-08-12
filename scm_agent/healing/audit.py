@@ -513,8 +513,8 @@ class SQLiteAuditRepository:
             ).fetchone()
             previous = None if latest is None else str(latest["state"])
             allowed = {
-                "planned": {"executing", "precondition_rejected", "failed"},
-                "executing": {"succeeded", "failed", "outcome_unknown"},
+                "planned": {"executing", "precondition_rejected", "failed", "outcome_unknown"},
+                "executing": {"succeeded", "failed", "outcome_unknown", "precondition_rejected"},
                 "succeeded": {"verified", "verification_failed"},
             }
             if result.status.value not in allowed.get(previous, set()):
@@ -592,20 +592,25 @@ class SQLiteAuditRepository:
             return listed
 
     def reconcile_orphans(self) -> list[int]:
-        """Append ``outcome_unknown`` for attempts interrupted while executing."""
+        """Atomically terminalize abandoned real intents without retrying them."""
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            executing = connection.execute(
-                """SELECT attempt.id FROM action_attempt AS attempt
-                   WHERE (SELECT state FROM action_transition WHERE action_attempt_id = attempt.id
-                          ORDER BY occurred_at DESC, id DESC LIMIT 1) = 'executing'
+            orphaned = connection.execute(
+                """SELECT attempt.id,
+                          (SELECT state FROM action_transition WHERE action_attempt_id = attempt.id
+                           ORDER BY occurred_at DESC, id DESC LIMIT 1) AS state
+                   FROM action_attempt AS attempt
+                   WHERE attempt.mode = 'act'
+                     AND (SELECT state FROM action_transition WHERE action_attempt_id = attempt.id
+                          ORDER BY occurred_at DESC, id DESC LIMIT 1) IN ('planned', 'executing')
                    ORDER BY attempt.id"""
             ).fetchall()
-            ids = [int(row["id"]) for row in executing]
-            for action_id in ids:
+            ids = [int(row["id"]) for row in orphaned]
+            for row in orphaned:
+                action_id = int(row["id"])
                 self._insert_action_transition(connection, action_id, "outcome_unknown", None, {
-                    "reason": "process restarted while action was executing",
+                    "reason": f"process restarted while action was {row['state']}",
                 })
             connection.commit()
             return ids

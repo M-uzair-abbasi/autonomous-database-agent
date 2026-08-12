@@ -230,6 +230,50 @@ class RaisingGateway(FakeGateway):
             raise OSError("safe indeterminate dispatch failure")
         return super().execute(plan)
 
+    def capture_after(self, plan: ActionPlan) -> Mapping[str, object]:
+        if self.stage == "after":
+            raise OSError("safe after-snapshot failure")
+        return super().capture_after(plan)
+
+
+class PostActionFailingRepository(SQLiteAuditRepository):
+    def __init__(self, *args: object, failure: str, repeat: bool = False, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.failure = failure
+        self.repeat = repeat
+        self.failures = 0
+        self.cycle_terminal_attempts = 0
+
+    def record_snapshot(
+        self, action_attempt_id: int, stage: str, data: Mapping[str, object]
+    ) -> int:
+        if self.failure == "after_snapshot" and stage == "after" and (
+            self.repeat or self.failures == 0
+        ):
+            self.failures += 1
+            raise OSError("audit after-snapshot unavailable")
+        return super().record_snapshot(action_attempt_id, stage, data)
+
+    def record_action_result(self, action_attempt_id: int, result: ActionResult) -> int:
+        if (
+            self.failure == "terminal_result"
+            and result.status is not ActionStatus.EXECUTING
+            and (self.repeat or self.failures == 0)
+        ):
+            self.failures += 1
+            raise OSError("audit terminal-result unavailable")
+        return super().record_action_result(action_attempt_id, result)
+
+    def finish_cycle(self, cycle_id: int, collector_statuses: Mapping[str, bool]) -> int:
+        self.cycle_terminal_attempts += 1
+        return super().finish_cycle(cycle_id, collector_statuses)
+
+    def record_cycle_transition(
+        self, cycle_id: int, state: str, detail: Mapping[str, object] | None = None
+    ) -> int:
+        self.cycle_terminal_attempts += 1
+        return super().record_cycle_transition(cycle_id, state, detail)
+
 
 class EngineResilienceTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -330,6 +374,80 @@ class EngineResilienceTests(unittest.TestCase):
         self.assertEqual((summary.status, summary.unknown_count), ("completed", 1))
         self.assertEqual(repository.list_actions(target_id)[0]["state"], "outcome_unknown")
 
+    def _cycle_states(self, repository: SQLiteAuditRepository) -> list[str]:
+        with repository._connect() as connection:
+            return [
+                str(row["state"])
+                for row in connection.execute(
+                    "SELECT state FROM cycle_transition ORDER BY id"
+                )
+            ]
+
+    def test_after_capture_failure_preserves_result_but_fails_cycle_without_success_claim(self) -> None:
+        gateway = RaisingGateway([pressured_snapshot(), pressured_snapshot()], stage="after")
+
+        _, repository, summary = self._run_twice(gateway)
+
+        target_id = repository.list_targets()[0]["id"]
+        self.assertEqual(len(gateway.executed), 1)
+        self.assertEqual(repository.list_actions(target_id)[0]["state"], "succeeded")
+        self.assertEqual(
+            (summary.status, summary.succeeded_count, summary.failed_count),
+            ("failed", 0, 1),
+        )
+        self.assertEqual(self._cycle_states(repository)[-1], "failed")
+
+    def test_after_snapshot_audit_failure_still_persists_known_result_and_terminalizes_cycle(self) -> None:
+        repository = PostActionFailingRepository(
+            self.path, clock=self.clock, failure="after_snapshot"
+        )
+        gateway = FakeGateway([pressured_snapshot(), pressured_snapshot()])
+
+        _, _, summary = self._run_twice(gateway, repository=repository)
+
+        target_id = repository.list_targets()[0]["id"]
+        self.assertEqual(len(gateway.executed), 1)
+        self.assertEqual(repository.list_actions(target_id)[0]["state"], "succeeded")
+        self.assertEqual(
+            (summary.status, summary.succeeded_count, summary.failed_count),
+            ("failed", 0, 1),
+        )
+        self.assertGreaterEqual(repository.cycle_terminal_attempts, 2)
+        self.assertEqual(self._cycle_states(repository)[-1], "failed")
+
+    def test_terminal_result_persistence_failure_falls_back_to_unknown_and_fails_cycle(self) -> None:
+        repository = PostActionFailingRepository(
+            self.path, clock=self.clock, failure="terminal_result"
+        )
+        gateway = FakeGateway([pressured_snapshot(), pressured_snapshot()])
+
+        _, _, summary = self._run_twice(gateway, repository=repository)
+
+        target_id = repository.list_targets()[0]["id"]
+        self.assertEqual(len(gateway.executed), 1)
+        self.assertEqual(repository.list_actions(target_id)[0]["state"], "outcome_unknown")
+        self.assertEqual(
+            (summary.status, summary.succeeded_count, summary.unknown_count),
+            ("failed", 0, 1),
+        )
+        self.assertEqual(self._cycle_states(repository)[-1], "failed")
+
+    def test_repeated_terminal_persistence_failure_leaves_explicitly_recoverable_action(self) -> None:
+        repository = PostActionFailingRepository(
+            self.path, clock=self.clock, failure="terminal_result", repeat=True
+        )
+        gateway = FakeGateway([pressured_snapshot(), pressured_snapshot()])
+
+        _, _, summary = self._run_twice(gateway, repository=repository)
+
+        target_id = repository.list_targets()[0]["id"]
+        self.assertEqual(len(gateway.executed), 1)
+        self.assertEqual(repository.list_actions(target_id)[0]["state"], "executing")
+        self.assertEqual(summary.status, "failed")
+        self.assertEqual(
+            SQLiteAuditRepository(self.path, clock=self.clock).reconcile_orphans(), [1]
+        )
+
     def test_stale_precondition_is_skipped_before_intent(self) -> None:
         gateway = FakeGateway(
             [pressured_snapshot(), pressured_snapshot()],
@@ -353,7 +471,12 @@ class EngineResilienceTests(unittest.TestCase):
 
         target_id = repository.list_targets()[0]["id"]
         self.assertEqual((summary.succeeded_count, summary.skipped_count), (0, 1))
-        self.assertEqual(repository.list_actions(target_id)[0]["state"], "failed")
+        self.assertEqual(
+            repository.list_actions(target_id)[0]["state"], "precondition_rejected"
+        )
+        self.assertIsNone(
+            repository.successful_action_at(target_id, ActionKind.VACUUM, "17:42")
+        )
 
     def test_unknown_result_is_preserved_and_cycle_completes(self) -> None:
         gateway = FakeGateway(
@@ -399,6 +522,27 @@ class EngineResilienceTests(unittest.TestCase):
         self.assertEqual(actions[-1]["state"], "outcome_unknown")
         self.assertEqual(action["state"], "succeeded")
 
+    def test_startup_recovers_planned_intent_and_does_not_permanently_block_later_cycle(self) -> None:
+        repository = SQLiteAuditRepository(self.path, clock=self.clock)
+        config = self._config()
+        target_id = repository.register_target(config.database_dsn, "fixture")
+        cycle_id = repository.start_cycle(target_id, Mode.ACT)
+        finding = detect_all(pressured_snapshot(), config.policy)[0]
+        event_id = repository.record_finding(cycle_id, finding, "tables")
+        plan = ActionPlanner().plan(finding, config)
+        assert plan is not None
+        orphan = repository.acquire_action_intent(event_id, plan, "planned-startup", None)
+        assert orphan.action_id is not None
+        gateway = FakeGateway([pressured_snapshot()])
+        restarted = HealingEngine(config, gateway, repository, clock=self.clock)
+
+        summary = restarted.run_once()
+
+        actions = repository.list_actions(target_id)
+        self.assertEqual(summary.recovered_orphan_count, 1)
+        self.assertEqual(summary.action_count, 1)
+        self.assertEqual([action["state"] for action in actions], ["outcome_unknown", "succeeded"])
+
     def test_action_budget_and_priority_choose_one_deterministic_target(self) -> None:
         snapshot = HealthSnapshot(
             observed_at=NOW,
@@ -415,6 +559,31 @@ class EngineResilienceTests(unittest.TestCase):
         self.assertEqual(summary.action_count, 1)
         self.assertEqual([plan.target_key for plan in gateway.executed], ["17:42"])
         self.assertEqual(len(repository.list_actions(target_id)), 1)
+
+    def test_defensive_engine_limits_override_an_unsafely_constructed_config(self) -> None:
+        safe = self._config()
+        unsafe = object.__new__(HealingConfig)
+        for name, value in vars(safe).items():
+            object.__setattr__(unsafe, name, value)
+        object.__setattr__(unsafe, "required_consecutive_detections", 1)
+        object.__setattr__(unsafe, "maximum_actions_per_cycle", 99)
+        snapshot = HealthSnapshot(
+            observed_at=NOW,
+            tables=(
+                TableStatsSample(NOW, 17, 42, "public", "first", 20_000, 10_000),
+                TableStatsSample(NOW, 17, 99, "public", "second", 20_000, 10_000),
+            ),
+        )
+        gateway = FakeGateway([snapshot])
+        repository = SQLiteAuditRepository(self.path, clock=self.clock)
+        engine = HealingEngine(unsafe, gateway, repository, clock=self.clock)
+
+        first = engine.run_once()
+        second = engine.run_once()
+
+        self.assertEqual(first.action_count, 0)
+        self.assertEqual(second.action_count, 1)
+        self.assertEqual(len(gateway.executed), 1)
 
     def test_cooldown_blocked_candidate_does_not_hide_another_eligible_plan(self) -> None:
         snapshot = HealthSnapshot(
@@ -612,6 +781,88 @@ class DaemonLoopTests(unittest.TestCase):
             engine.run_forever(lambda: True)
 
             self.assertEqual(gateway.read_trace, [])
+
+    def test_run_forever_continues_after_one_cycle_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "audit.sqlite3"
+            timer = FakeMonotonicSleeper()
+            repository = SQLiteAuditRepository(path, clock=MutableClock())
+            gateway = FakeGateway([HealthSnapshot(observed_at=NOW)])
+            engine = HealingEngine(
+                HealingConfig(
+                    mode=Mode.OBSERVE,
+                    audit_path=path,
+                    poll_interval=timedelta(seconds=10),
+                ),
+                gateway,
+                repository,
+                clock=MutableClock(),
+                sleeper=timer.sleep,
+                monotonic=timer.monotonic,
+            )
+            original = engine.run_once
+            attempts = 0
+
+            def flaky_cycle():
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise OSError("one cycle failed")
+                return original()
+
+            engine.run_once = flaky_cycle  # type: ignore[method-assign]
+
+            engine.run_forever(lambda: attempts >= 2)
+
+            self.assertEqual(attempts, 2)
+            self.assertEqual(gateway.read_trace, ["collect"])
+            self.assertEqual(timer.sleeps, [10.0])
+
+    def test_daemon_runs_next_cycle_after_post_action_audit_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "audit.sqlite3"
+            timer = FakeMonotonicSleeper()
+            clock = MutableClock()
+            repository = PostActionFailingRepository(
+                path, clock=clock, failure="after_snapshot"
+            )
+            gateway = FakeGateway([pressured_snapshot()])
+            engine = HealingEngine(
+                HealingConfig(
+                    mode=Mode.ACT,
+                    audit_path=path,
+                    poll_interval=timedelta(seconds=10),
+                ),
+                gateway,
+                repository,
+                clock=clock,
+                sleeper=timer.sleep,
+                monotonic=timer.monotonic,
+            )
+            original = engine.run_once
+            cycles = 0
+
+            def counted_cycle():
+                nonlocal cycles
+                result = original()
+                cycles += 1
+                return result
+
+            engine.run_once = counted_cycle  # type: ignore[method-assign]
+
+            engine.run_forever(lambda: cycles >= 3)
+
+            with repository._connect() as connection:
+                states = [
+                    str(row["state"])
+                    for row in connection.execute(
+                        "SELECT state FROM cycle_transition ORDER BY id"
+                    )
+                ]
+            self.assertEqual(cycles, 3)
+            self.assertEqual(len(gateway.executed), 1)
+            self.assertIn("failed", states)
+            self.assertEqual(gateway.read_trace.count("collect"), 3)
 
 
 if __name__ == "__main__":

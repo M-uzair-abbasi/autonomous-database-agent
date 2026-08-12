@@ -120,8 +120,10 @@ class HealingConfig:
         if not str(self.audit_path).strip():
             raise ValueError("audit_path must not be empty")
         _positive(self.poll_interval.total_seconds(), "poll_interval")
-        _positive(self.maximum_actions_per_cycle, "maximum_actions_per_cycle")
-        _positive(self.required_consecutive_detections, "required_consecutive_detections")
+        if self.maximum_actions_per_cycle != 1:
+            raise ValueError("maximum_actions_per_cycle must be exactly one in v1")
+        if self.required_consecutive_detections < 2:
+            raise ValueError("required_consecutive_detections must be at least two")
         if self.vacuum_cooldown < timedelta(hours=6):
             raise ValueError("vacuum_cooldown must be at least six hours")
         _positive(self.lock_timeout.total_seconds(), "lock_timeout")

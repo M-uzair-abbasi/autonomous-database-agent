@@ -64,6 +64,10 @@ class AuditRepository(Protocol):
 
     def finish_cycle(self, cycle_id: int, collector_statuses: Mapping[str, bool]) -> int: ...
 
+    def record_cycle_transition(
+        self, cycle_id: int, state: str, detail: Mapping[str, object] | None = None
+    ) -> int: ...
+
 
 class Clock(Protocol):
     def __call__(self) -> datetime: ...
@@ -152,10 +156,21 @@ class HealingEngine:
 
         cycle_id = self._audit.start_cycle(self._target_id, self._config.mode)
         try:
+            return self._run_started_cycle(cycle_id, recovered)
+        except Exception:
+            self._try_fail_cycle(cycle_id, "cycle_exception")
+            raise
+
+    def _run_started_cycle(self, cycle_id: int, recovered: int) -> CycleSummary:
+        try:
             snapshot = self._gateway.collect_health()
         except Exception:
             self._audit.finish_cycle(cycle_id, {collector: False for collector in _COLLECTORS})
-            return CycleSummary(status="failed", collector_error_count=len(_COLLECTORS), recovered_orphan_count=recovered)
+            return CycleSummary(
+                status="failed",
+                collector_error_count=len(_COLLECTORS),
+                recovered_orphan_count=recovered,
+            )
         failed_collectors = {
             _COLLECTOR_ALIASES.get(error.collector, error.collector)
             for error in snapshot.errors
@@ -191,9 +206,10 @@ class HealingEngine:
         action_count = simulated = succeeded = failed = unknown = skipped = 0
         cycle_status = "completed"
         for plan, event_id in planned:
-            if action_count >= self._config.maximum_actions_per_cycle:
+            if action_count >= 1:
                 break
-            if self._audit.consecutive_detection_count(event_id) < self._config.required_consecutive_detections:
+            required_detections = max(2, self._config.required_consecutive_detections)
+            if self._audit.consecutive_detection_count(event_id) < required_detections:
                 skipped += 1
                 continue
             decision = self._gateway.check_plan(plan)
@@ -238,9 +254,14 @@ class HealingEngine:
                 continue
 
             if plan.mode is Mode.DRY_RUN:
-                after = self._gateway.capture_after(plan)
-                self._audit.record_snapshot(action_id, "after", after)
-                simulated += 1
+                try:
+                    after = self._gateway.capture_after(plan)
+                    self._audit.record_snapshot(action_id, "after", after)
+                except Exception:
+                    cycle_status = "failed"
+                    failed += 1
+                else:
+                    simulated += 1
                 continue
 
             self._audit.record_action_result(
@@ -259,20 +280,57 @@ class HealingEngine:
                     occurred_at,
                     error="gateway_dispatch_exception",
                 )
-            after = self._gateway.capture_after(plan)
-            self._audit.record_snapshot(action_id, "after", after)
-            stored_result = result
-            if result.status is ActionStatus.PRECONDITION_REJECTED:
-                stored_result = ActionResult(
-                    result.action_kind,
-                    ActionStatus.FAILED,
-                    result.target_key,
-                    result.started_at,
-                    result.completed_at,
-                    error=result.error,
-                    evidence={**dict(result.evidence), "gateway_status": result.status.value},
+            post_failed = False
+            try:
+                after = self._gateway.capture_after(plan)
+            except Exception:
+                post_failed = True
+            else:
+                try:
+                    self._audit.record_snapshot(action_id, "after", after)
+                except Exception:
+                    post_failed = True
+
+            result_persisted = False
+            fallback_persisted = False
+            try:
+                self._audit.record_action_result(action_id, result)
+                result_persisted = True
+            except Exception:
+                post_failed = True
+                occurred_at = self._clock()
+                fallback = ActionResult(
+                    plan.action_kind,
+                    ActionStatus.OUTCOME_UNKNOWN,
+                    plan.target_key,
+                    occurred_at,
+                    occurred_at,
+                    error="terminal_result_persistence_failed",
                 )
-            self._audit.record_action_result(action_id, stored_result)
+                try:
+                    self._audit.record_action_result(action_id, fallback)
+                    result_persisted = True
+                    fallback_persisted = True
+                except Exception:
+                    pass
+
+            if post_failed:
+                cycle_status = "failed"
+                if fallback_persisted or not result_persisted:
+                    unknown += 1
+                elif result.status is ActionStatus.SUCCEEDED:
+                    # The database result is retained, but the incomplete saga
+                    # must not be reported as a completed success.
+                    failed += 1
+                elif result.status is ActionStatus.PRECONDITION_REJECTED:
+                    skipped += 1
+                    failed += 1
+                elif result.status is ActionStatus.OUTCOME_UNKNOWN:
+                    unknown += 1
+                else:
+                    failed += 1
+                continue
+
             if result.status is ActionStatus.SUCCEEDED:
                 succeeded += 1
             elif result.status is ActionStatus.OUTCOME_UNKNOWN:
@@ -282,7 +340,10 @@ class HealingEngine:
             else:
                 failed += 1
 
-        self._audit.finish_cycle(cycle_id, collector_statuses)
+        if cycle_status == "completed":
+            self._audit.finish_cycle(cycle_id, collector_statuses)
+        else:
+            self._try_fail_cycle(cycle_id, "cycle_stage_failure")
         return CycleSummary(
             status=cycle_status,
             finding_count=len(findings),
@@ -296,6 +357,12 @@ class HealingEngine:
             skipped_count=skipped,
             recovered_orphan_count=recovered,
         )
+
+    def _try_fail_cycle(self, cycle_id: int, reason: str) -> None:
+        try:
+            self._audit.record_cycle_transition(cycle_id, "failed", {"reason": reason})
+        except Exception:
+            pass
 
     def _cooldown(self, plan: ActionPlan) -> timedelta | None:
         if plan.mode is Mode.ACT and plan.action_kind is ActionKind.VACUUM:
@@ -314,7 +381,10 @@ class HealingEngine:
         interval = self._config.poll_interval.total_seconds()
         while not stop():
             started = self._monotonic()
-            self.run_once()
+            try:
+                self.run_once()
+            except Exception:
+                pass
             if stop():
                 return
             remaining = interval - (self._monotonic() - started)

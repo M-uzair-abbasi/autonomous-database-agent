@@ -93,6 +93,24 @@ class HealingConfigFromEnvironmentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "timeout"):
             HealingConfig.from_env({"SCM_HEALING_STATEMENT_TIMEOUT_SECONDS": "0"})
 
+    def test_v1_rejects_weakened_detection_and_action_safety_limits(self) -> None:
+        for values, message in (
+            ({"maximum_actions_per_cycle": 0}, "exactly one"),
+            ({"maximum_actions_per_cycle": 2}, "exactly one"),
+            ({"required_consecutive_detections": 1}, "at least two"),
+        ):
+            with self.subTest(values=values):
+                with self.assertRaisesRegex(ValueError, message):
+                    HealingConfig(**values)
+
+        for environ, message in (
+            ({"SCM_HEALING_MAX_ACTIONS_PER_CYCLE": "2"}, "exactly one"),
+            ({"SCM_HEALING_REQUIRED_CONSECUTIVE": "1"}, "at least two"),
+        ):
+            with self.subTest(environ=environ):
+                with self.assertRaisesRegex(ValueError, message):
+                    HealingConfig.from_env(environ)
+
     def test_safe_summary_omits_database_dsn_and_password(self) -> None:
         config = HealingConfig.from_env(
             {"SCM_DB_DSN": "postgresql://operator:top-secret@db.example/healing"}

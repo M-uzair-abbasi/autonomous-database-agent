@@ -256,6 +256,35 @@ class SQLiteAuditRepositoryTests(unittest.TestCase):
                 action_id, ActionResult(ActionKind.VACUUM, ActionStatus.SUCCEEDED, "17:42", NOW, NOW)
             )
 
+    def test_execute_time_precondition_rejection_is_truthful_and_consumes_no_cooldown(self) -> None:
+        _, event_id = self._cycle_with_event()
+        action_id = self.repo.record_action_intent(event_id, plan(), "runtime-precondition")
+        assert action_id is not None
+        self.repo.record_action_result(
+            action_id, ActionResult(ActionKind.VACUUM, ActionStatus.EXECUTING, "17:42", NOW)
+        )
+
+        self.repo.record_action_result(
+            action_id,
+            ActionResult(
+                ActionKind.VACUUM,
+                ActionStatus.PRECONDITION_REJECTED,
+                "17:42",
+                NOW,
+                NOW + timedelta(seconds=1),
+                evidence={"reason": "stale_relation_identity"},
+            ),
+        )
+
+        self.assertEqual(self.repo.list_actions(self.target_id)[0]["state"], "precondition_rejected")
+        self.assertIsNone(
+            self.repo.successful_action_at(self.target_id, ActionKind.VACUUM, "17:42")
+        )
+        retry = self.repo.acquire_action_intent(
+            event_id, plan(), "runtime-precondition-retry", timedelta(hours=6)
+        )
+        self.assertEqual(retry.status, "acquired")
+
     def test_before_and_after_snapshots_are_ordered_and_json_is_canonical(self) -> None:
         _, event_id = self._cycle_with_event()
         action_id = self.repo.record_action_intent(event_id, plan(), "snapshots")
@@ -278,6 +307,54 @@ class SQLiteAuditRepositoryTests(unittest.TestCase):
 
         self.assertEqual(reopened.reconcile_orphans(), [action_id])
         self.assertEqual(reopened.list_actions(self.target_id)[0]["state"], "outcome_unknown")
+
+    def test_recovery_marks_a_planned_act_attempt_unknown_and_releases_its_lease(self) -> None:
+        _, event_id = self._cycle_with_event()
+        action_id = self.repo.record_action_intent(event_id, plan(), "planned-orphan")
+        assert action_id is not None
+        reopened = SQLiteAuditRepository(self.path, clock=FixedClock())
+
+        self.assertEqual(reopened.reconcile_orphans(), [action_id])
+        self.assertEqual(reopened.list_actions(self.target_id)[0]["state"], "outcome_unknown")
+        self.assertEqual(reopened.reconcile_orphans(), [])
+        retry = reopened.acquire_action_intent(
+            event_id, plan(), "after-planned-orphan", timedelta(hours=6)
+        )
+        self.assertEqual(retry.status, "acquired")
+
+    def test_recovery_never_changes_a_dry_run_simulation(self) -> None:
+        _, event_id = self._cycle_with_event()
+        action_id = self.repo.record_action_intent(
+            event_id, plan(mode=Mode.DRY_RUN), "dry-run-not-orphan"
+        )
+        assert action_id is not None
+
+        self.assertEqual(self.repo.reconcile_orphans(), [])
+        self.assertEqual(self.repo.list_actions(self.target_id)[0]["state"], "simulated")
+
+    def test_concurrent_repositories_recover_one_planned_orphan_once(self) -> None:
+        _, event_id = self._cycle_with_event()
+        action_id = self.repo.record_action_intent(event_id, plan(), "planned-contended")
+        assert action_id is not None
+        repositories = (
+            SQLiteAuditRepository(self.path, clock=FixedClock()),
+            SQLiteAuditRepository(self.path, clock=FixedClock()),
+        )
+        barrier = threading.Barrier(2)
+        results: list[list[int]] = []
+
+        def recover(repository: SQLiteAuditRepository) -> None:
+            barrier.wait()
+            results.append(repository.reconcile_orphans())
+
+        threads = [threading.Thread(target=recover, args=(repository,)) for repository in repositories]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(sorted(results), [[], [action_id]])
+        self.assertEqual(self.repo.list_actions(self.target_id)[0]["state"], "outcome_unknown")
 
     def test_concurrent_repositories_only_one_acquires_an_action_target_lease(self) -> None:
         _, event_id = self._cycle_with_event()
