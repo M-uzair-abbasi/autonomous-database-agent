@@ -369,22 +369,22 @@ class SQLiteAuditRepositoryTests(unittest.TestCase):
 
     def test_ddl_security_and_maintenance_sql_never_persist_in_free_form_fields(self) -> None:
         statements = {
-            "label": "ALTER ROLE alice PASSWORD 'sentinel-secret'",
-            "cycle_state": "CREATE TABLE confidential (secret text)",
-            "cycle_detail": "DROP TABLE confidential",
-            "fingerprint": "GRANT ALL ON confidential TO alice",
-            "rule_version": "REVOKE ALL ON confidential FROM alice",
-            "target_key": "COMMENT ON TABLE confidential IS 'sentinel-secret'",
-            "collector": "TRUNCATE confidential",
-            "evidence": "VACUUM FULL confidential",
-            "recommendation": "REINDEX confidential_idx",
+            "label": "ALTER FOREIGN DATA WRAPPER audit_fdw VALIDATOR noop",
+            "cycle_state": "DROP MATERIALIZED VIEW confidential_rollup",
+            "cycle_detail": "SET ROLE audit_admin",
+            "fingerprint": "DELETE /* concealed */ FROM confidential",
+            "rule_version": "ALTER ROLE alice PASSWORD 'sentinel-secret'",
+            "target_key": "GRANT ALL ON confidential TO alice",
+            "collector": "REVOKE ALL ON confidential FROM alice",
+            "evidence": "COMMENT ON TABLE confidential IS 'sentinel-secret'",
+            "recommendation": "TRUNCATE confidential",
             "command": "ALTER ROLE alice PASSWORD 'sentinel-secret'",
-            "parameters": "CREATE ROLE intruder LOGIN PASSWORD 'sentinel-secret'",
-            "reason": "DROP OWNED BY alice",
-            "idempotency": "GRANT ALL ON confidential TO alice",
-            "error": "REVOKE ALL ON confidential FROM alice",
-            "result_evidence": "COMMENT ON TABLE confidential IS 'sentinel-secret'",
-            "snapshot": "TRUNCATE confidential",
+            "parameters": "VACUUM FULL confidential",
+            "reason": "REINDEX confidential_idx",
+            "idempotency": "CREATE ROLE intruder LOGIN PASSWORD 'sentinel-secret'",
+            "error": "DROP OWNED BY alice",
+            "result_evidence": "ALTER ROLE alice PASSWORD 'sentinel-secret'",
+            "snapshot": "DELETE /* concealed */ FROM confidential",
         }
         self.repo.register_target("postgresql://scm:other@db.example:5434/other", statements["label"])
         cycle_id = self.repo.start_cycle(self.target_id, Mode.ACT)
@@ -494,7 +494,7 @@ class SQLiteAuditRepositoryTests(unittest.TestCase):
         )
 
     def test_non_sql_human_explanations_remain_usable(self) -> None:
-        explanation = "Maintenance was deferred because the operator is reviewing the lock window."
+        explanation = "Maintenance is delayed while an administrator reviews timing."
         cycle_id = self.repo.start_cycle(self.target_id, Mode.OBSERVE)
         self.repo.record_cycle_transition(cycle_id, "operator_note", {"explanation": explanation})
 
@@ -503,7 +503,45 @@ class SQLiteAuditRepositoryTests(unittest.TestCase):
                 "SELECT detail_json FROM cycle_transition WHERE cycle_id = ? ORDER BY id DESC LIMIT 1",
                 (cycle_id,),
             ).fetchone()[0]
-        self.assertEqual(stored, '{"explanation":"Maintenance was deferred because the operator is reviewing the lock window."}')
+        self.assertEqual(stored, '{"explanation":"Maintenance is delayed while an administrator reviews timing."}')
+
+    def test_lexical_command_and_marker_corpus_is_redacted_from_sqlite_and_wal(self) -> None:
+        command_tokens = (
+            "ABORT", "ALTER", "ANALYZE", "BEGIN", "CALL", "CHECKPOINT", "CLOSE", "CLUSTER", "COMMENT",
+            "COMMIT", "COPY", "CREATE", "DEALLOCATE", "DECLARE", "DELETE", "DISCARD", "DO", "DROP", "END",
+            "EXECUTE", "EXPLAIN", "FETCH", "GRANT", "IMPORT", "INSERT", "LISTEN", "LOAD", "LOCK", "MERGE",
+            "MOVE", "NOTIFY", "PREPARE", "REASSIGN", "REFRESH", "REINDEX", "RELEASE", "RESET", "REVOKE",
+            "ROLLBACK", "SAVEPOINT", "SECURITY", "SELECT", "SET", "SHOW", "START", "TRUNCATE", "UNLISTEN",
+            "UPDATE", "VACUUM", "VALUES", "WITH",
+        )
+        markers = ("--", "/*", "*/", ";", "$$", "$audit_tag$")
+        credentials = ("password", "passwd", "pwd", "secret", "token", "api_key", "api-token")
+        corpus = [
+            (f"review-{token.lower()} {token} audit-sentinel-{index}", "[redacted-query]")
+            for index, token in enumerate(command_tokens)
+        ] + [
+            (f"marker{marker}audit-sentinel-{index}", "[redacted-query]")
+            for index, marker in enumerate(markers)
+        ] + [
+            (f"credential {marker} audit-sentinel-{index}", "[redacted-secret]")
+            for index, marker in enumerate(credentials)
+        ]
+
+        for value, expected in corpus:
+            cycle_id = self.repo.start_cycle(self.target_id, Mode.OBSERVE)
+            self.repo.record_cycle_transition(cycle_id, "note", {"value": value})
+            with sqlite3.connect(self.path) as connection:
+                stored = connection.execute(
+                    "SELECT detail_json FROM cycle_transition WHERE cycle_id = ? ORDER BY id DESC LIMIT 1",
+                    (cycle_id,),
+                ).fetchone()[0]
+            self.assertEqual(stored, f'{{"value":"{expected}"}}')
+
+        stored_bytes = b"".join(
+            candidate.read_bytes() for candidate in (self.path, Path(f"{self.path}-wal")) if candidate.exists()
+        )
+        for value, _ in corpus:
+            self.assertNotIn(value.encode(), stored_bytes)
 
 
 if __name__ == "__main__":
