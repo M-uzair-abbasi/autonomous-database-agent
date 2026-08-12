@@ -8,23 +8,34 @@ maintenance command, so a process crash leaves a durable, reconcilable record.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, is_dataclass
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, is_dataclass
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import hashlib
 import json
 from pathlib import Path
 import re
 import sqlite3
-from typing import Any
 
 from .models import ActionKind, ActionPlan, ActionResult, Finding, Mode
 
 
 Clock = Callable[[], datetime]
 _DSN_PATTERN = re.compile(r"(?:[a-z][a-z0-9+.-]*://)\S+", re.IGNORECASE)
+_CONNINFO_PATTERN = re.compile(r"\b(?:host|hostaddr|port|dbname|user|username|password|pass|pwd)\s*=", re.IGNORECASE)
+_QUERY_PATTERN = re.compile(r"\b(?:select|insert|update|delete|with|merge|copy)\b", re.IGNORECASE)
+_TERMINATE_COMMAND = re.compile(r"select\s+pg_terminate_backend\s*\([^;]*\)\s*", re.IGNORECASE)
 _SAFE_LABEL = re.compile(r"[^a-zA-Z0-9._ -]+")
 _MAX_ERROR_LENGTH = 500
+
+
+@dataclass(frozen=True)
+class ActionIntentAcquisition:
+    """The atomically determined disposition of an action-intent request."""
+
+    status: str
+    action_id: int | None = None
+    cooldown_until: datetime | None = None
 
 
 def _utc_now() -> datetime:
@@ -37,18 +48,45 @@ def _iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
-def _json_safe(value: object) -> object:
+def _is_safe_healing_command(value: str) -> bool:
+    normalized = value.strip().lower()
+    return (
+        (normalized.startswith("vacuum") and ";" not in normalized)
+        or (normalized.startswith("reindex") and ";" not in normalized)
+        or _TERMINATE_COMMAND.fullmatch(normalized) is not None
+    )
+
+
+def _sanitize_text(value: str, key: str | None = None) -> str:
+    """Remove credentials and arbitrary SQL text from durable audit fields."""
+    normalized_key = (key or "").lower()
+    if "query" in normalized_key:
+        return "[redacted-query]"
+    if _CONNINFO_PATTERN.search(value):
+        return "[redacted-conninfo]"
+    without_uri = _DSN_PATTERN.sub("[redacted-dsn]", value)
+    if _QUERY_PATTERN.search(without_uri) and not _is_safe_healing_command(without_uri):
+        return "[redacted-query]"
+    return without_uri.replace("\x00", " ")[:_MAX_ERROR_LENGTH]
+
+
+def _json_safe(value: object, key: str | None = None) -> object:
     if isinstance(value, datetime):
         return _iso(value)
     if isinstance(value, Enum):
         return value.value
     if is_dataclass(value):
-        return _json_safe(asdict(value))
+        return _json_safe(asdict(value), key)
     if isinstance(value, Mapping):
-        return {str(key): _json_safe(item) for key, item in value.items()}
+        return {
+            _sanitize_text(str(item_key), "field_name"): _json_safe(item, str(item_key))
+            for item_key, item in value.items()
+        }
     if isinstance(value, (tuple, list)):
-        return [_json_safe(item) for item in value]
-    if value is None or isinstance(value, (str, int, float, bool)):
+        return [_json_safe(item, key) for item in value]
+    if isinstance(value, str):
+        return _sanitize_text(value, key)
+    if value is None or isinstance(value, (int, float, bool)):
         return value
     raise TypeError(f"{type(value).__name__} is not JSON-safe")
 
@@ -59,6 +97,10 @@ def _json(value: object) -> str:
 
 def _sanitize_label(value: str, target_hash: str) -> str:
     without_dsn = _DSN_PATTERN.sub("", value).strip(" -:/")
+    if _CONNINFO_PATTERN.search(without_dsn):
+        without_dsn = ""
+    if _QUERY_PATTERN.search(without_dsn):
+        without_dsn = ""
     cleaned = _SAFE_LABEL.sub("", without_dsn).strip()
     return (cleaned[:120] or f"target-{target_hash[:12]}")
 
@@ -66,7 +108,7 @@ def _sanitize_label(value: str, target_hash: str) -> str:
 def _sanitize_error(value: str | None) -> str | None:
     if value is None:
         return None
-    return _DSN_PATTERN.sub("[redacted-dsn]", value).replace("\x00", " ")[:_MAX_ERROR_LENGTH]
+    return _sanitize_text(value, "error")
 
 
 _SCHEMA = """
@@ -111,6 +153,8 @@ CREATE TABLE IF NOT EXISTS event_transition (
     occurred_at TEXT NOT NULL,
     detail_json TEXT NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS event_transition_one_per_event_cycle
+ON event_transition(event_id, cycle_id);
 CREATE TABLE IF NOT EXISTS action_attempt (
     id INTEGER PRIMARY KEY,
     event_id INTEGER NOT NULL REFERENCES anomaly_event(id),
@@ -218,7 +262,7 @@ class SQLiteAuditRepository:
     ) -> int:
         cursor = connection.execute(
             "INSERT INTO cycle_transition(cycle_id, state, occurred_at, detail_json) VALUES (?, ?, ?, ?)",
-            (cycle_id, state, self._now(), _json(detail)),
+            (cycle_id, _sanitize_text(state, "state"), self._now(), _json(detail)),
         )
         return int(cursor.lastrowid)
 
@@ -229,6 +273,9 @@ class SQLiteAuditRepository:
     def record_finding(self, cycle_id: int, item: Finding, collector: str) -> int:
         if not collector.strip():
             raise ValueError("collector must not be empty")
+        safe_collector = _sanitize_text(collector, "collector")
+        safe_fingerprint = _sanitize_text(item.fingerprint, "fingerprint")
+        safe_target_key = _sanitize_text(item.target_key, "target_key")
         finding_data = _json(item)
         with self._connect() as connection:
             target = connection.execute("SELECT target_id FROM poll_cycle WHERE id = ?", (cycle_id,)).fetchone()
@@ -236,7 +283,7 @@ class SQLiteAuditRepository:
                 raise ValueError("unknown poll cycle")
             event = connection.execute(
                 "SELECT id FROM anomaly_event WHERE target_id = ? AND fingerprint = ?",
-                (target["target_id"], item.fingerprint),
+                (target["target_id"], safe_fingerprint),
             ).fetchone()
             if event is None:
                 cursor = connection.execute(
@@ -245,8 +292,8 @@ class SQLiteAuditRepository:
                         target_key, collector, finding_json, created_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
-                        target["target_id"], item.fingerprint, item.rule_id.value, item.rule_version,
-                        item.severity.value, item.target_kind.value, item.target_key, collector,
+                        target["target_id"], safe_fingerprint, item.rule_id.value, _sanitize_text(item.rule_version, "rule_version"),
+                        item.severity.value, item.target_kind.value, safe_target_key, safe_collector,
                         finding_data, self._now(),
                     ),
                 )
@@ -256,7 +303,11 @@ class SQLiteAuditRepository:
                 event_id = int(event["id"])
                 latest = self._event_state(connection, event_id)
                 state = "detected" if latest == "cleared" else "still_present"
-            self._insert_event_transition(connection, event_id, cycle_id, state, {"collector": collector})
+            already_recorded = connection.execute(
+                "SELECT 1 FROM event_transition WHERE event_id = ? AND cycle_id = ?", (event_id, cycle_id)
+            ).fetchone()
+            if already_recorded is None:
+                self._insert_event_transition(connection, event_id, cycle_id, state, {"collector": safe_collector})
             return event_id
 
     def _insert_event_transition(
@@ -283,22 +334,22 @@ class SQLiteAuditRepository:
             cycle = connection.execute("SELECT target_id FROM poll_cycle WHERE id = ?", (cycle_id,)).fetchone()
             if cycle is None:
                 raise ValueError("unknown poll cycle")
-            all_collectors_succeeded = bool(collector_statuses) and all(collector_statuses.values())
-            if all_collectors_succeeded:
-                events = connection.execute(
-                    """SELECT event.id, event.collector FROM anomaly_event AS event
-                       WHERE event.target_id = ?
-                       AND COALESCE((SELECT state FROM event_transition
-                                     WHERE event_id = event.id ORDER BY occurred_at DESC, id DESC LIMIT 1), '') != 'cleared'
-                       AND NOT EXISTS (SELECT 1 FROM event_transition current
-                                       WHERE current.event_id = event.id AND current.cycle_id = ?
-                                         AND current.state IN ('detected', 'still_present'))
-                       ORDER BY event.id""",
-                    (cycle["target_id"], cycle_id),
-                ).fetchall()
-                for event in events:
+            events = connection.execute(
+                """SELECT event.id, event.collector FROM anomaly_event AS event
+                   WHERE event.target_id = ?
+                   AND COALESCE((SELECT state FROM event_transition
+                                 WHERE event_id = event.id ORDER BY occurred_at DESC, id DESC LIMIT 1), '') != 'cleared'
+                   AND NOT EXISTS (SELECT 1 FROM event_transition current
+                                   WHERE current.event_id = event.id AND current.cycle_id = ?
+                                     AND current.state IN ('detected', 'still_present'))
+                   ORDER BY event.id""",
+                (cycle["target_id"], cycle_id),
+            ).fetchall()
+            for event in events:
+                required_collector = str(event["collector"])
+                if collector_statuses.get(required_collector) is True:
                     self._insert_event_transition(connection, int(event["id"]), cycle_id, "cleared", {
-                        "collector": event["collector"],
+                        "collector": required_collector,
                     })
             return self._insert_cycle_transition(connection, cycle_id, "completed", {
                 "collectors": dict(collector_statuses),
@@ -306,31 +357,87 @@ class SQLiteAuditRepository:
 
     def consecutive_detection_count(self, event_id: int) -> int:
         with self._connect() as connection:
-            states = [str(row["state"]) for row in connection.execute(
-                "SELECT state FROM event_transition WHERE event_id = ? ORDER BY occurred_at DESC, id DESC", (event_id,)
-            )]
-        count = 0
-        for state in states:
-            if state == "cleared":
-                break
-            if state in {"detected", "still_present"}:
-                count += 1
-        return count
+            last_clear = connection.execute(
+                "SELECT id FROM event_transition WHERE event_id = ? AND state = 'cleared' ORDER BY occurred_at DESC, id DESC LIMIT 1",
+                (event_id,),
+            ).fetchone()
+            after_transition = 0 if last_clear is None else int(last_clear["id"])
+            row = connection.execute(
+                """SELECT COUNT(DISTINCT cycle_id) AS count FROM event_transition
+                   WHERE event_id = ? AND id > ? AND state IN ('detected', 'still_present')""",
+                (event_id, after_transition),
+            ).fetchone()
+        return int(row["count"])
 
-    def record_action_intent(self, event_id: int, item: ActionPlan, idempotency_key: str) -> int | None:
-        """Durably acquire an action lease and commit it before returning its id."""
+    def acquire_action_intent(
+        self,
+        event_id: int,
+        item: ActionPlan,
+        idempotency_key: str,
+        cooldown: timedelta | None,
+    ) -> ActionIntentAcquisition:
+        """Atomically check ACT cooldown/leases and durably record an intent.
+
+        ``acquired`` is the only disposition that authorizes a caller to run an
+        external PostgreSQL action. ``duplicate`` covers an idempotency replay
+        or a still-active action/target lease; ``cooldown`` includes its expiry.
+        """
         if not idempotency_key.strip():
             raise ValueError("idempotency_key must not be empty")
+        if cooldown is not None and cooldown.total_seconds() < 0:
+            raise ValueError("cooldown must not be negative")
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            event = connection.execute(
+                "SELECT target_id FROM anomaly_event WHERE id = ?", (event_id,)
+            ).fetchone()
+            if event is None:
+                raise ValueError("unknown anomaly event")
+            safe_key = _sanitize_text(idempotency_key, "idempotency_key")
+            existing_key = connection.execute(
+                "SELECT id FROM action_attempt WHERE idempotency_key = ?", (safe_key,)
+            ).fetchone()
+            if existing_key is not None:
+                connection.commit()
+                return ActionIntentAcquisition("duplicate")
+            if item.mode is Mode.ACT:
+                active = connection.execute(
+                    """SELECT attempt.id FROM action_attempt AS attempt
+                       JOIN anomaly_event AS event ON event.id = attempt.event_id
+                       WHERE event.target_id = ? AND attempt.action_kind = ? AND attempt.target_key = ?
+                         AND attempt.mode = 'act'
+                         AND (SELECT state FROM action_transition
+                              WHERE action_attempt_id = attempt.id ORDER BY occurred_at DESC, id DESC LIMIT 1)
+                             IN ('planned', 'executing')
+                       ORDER BY attempt.id LIMIT 1""",
+                    (event["target_id"], item.action_kind.value, _sanitize_text(item.target_key, "target_key")),
+                ).fetchone()
+                if active is not None:
+                    connection.commit()
+                    return ActionIntentAcquisition("duplicate")
+                if cooldown is not None:
+                    succeeded = connection.execute(
+                        """SELECT transition.occurred_at FROM action_transition AS transition
+                           JOIN action_attempt AS attempt ON attempt.id = transition.action_attempt_id
+                           JOIN anomaly_event AS prior_event ON prior_event.id = attempt.event_id
+                           WHERE prior_event.target_id = ? AND attempt.action_kind = ? AND attempt.target_key = ?
+                             AND attempt.mode = 'act' AND transition.state = 'succeeded'
+                           ORDER BY transition.occurred_at DESC, transition.id DESC LIMIT 1""",
+                        (event["target_id"], item.action_kind.value, _sanitize_text(item.target_key, "target_key")),
+                    ).fetchone()
+                    if succeeded is not None:
+                        cooldown_until = datetime.fromisoformat(str(succeeded["occurred_at"])) + cooldown
+                        if self.clock() < cooldown_until:
+                            connection.commit()
+                            return ActionIntentAcquisition("cooldown", cooldown_until=cooldown_until)
             cursor = connection.execute(
                 """INSERT INTO action_attempt(
                     event_id, idempotency_key, action_kind, target_key, mode, command, plan_json, intended_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    event_id, idempotency_key, item.action_kind.value, item.target_key, item.mode.value,
-                    item.command, _json(item), self._now(),
+                    event_id, safe_key, item.action_kind.value, _sanitize_text(item.target_key, "target_key"), item.mode.value,
+                    _sanitize_text(item.command, "command"), _json(item), self._now(),
                 ),
             )
             action_id = int(cursor.lastrowid)
@@ -338,17 +445,22 @@ class SQLiteAuditRepository:
                 connection, action_id, "simulated" if item.mode is Mode.DRY_RUN else "planned", None, {}
             )
             connection.commit()
-            return action_id
+            return ActionIntentAcquisition("acquired", action_id=action_id)
         except sqlite3.IntegrityError as exc:
             connection.rollback()
             if "idempotency_key" in str(exc):
-                return None
+                return ActionIntentAcquisition("duplicate")
             raise
         except BaseException:
             connection.rollback()
             raise
         finally:
             connection.close()
+
+    def record_action_intent(self, event_id: int, item: ActionPlan, idempotency_key: str) -> int | None:
+        """Compatibility wrapper for callers that only need an acquired ID."""
+        acquisition = self.acquire_action_intent(event_id, item, idempotency_key, None)
+        return acquisition.action_id if acquisition.status == "acquired" else None
 
     def _insert_action_transition(
         self,
@@ -368,10 +480,40 @@ class SQLiteAuditRepository:
 
     def record_action_result(self, action_attempt_id: int, result: ActionResult) -> int:
         occurred = result.completed_at if result.completed_at is not None else result.started_at
-        with self._connect() as connection:
-            return self._insert_action_transition(
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = connection.execute(
+                "SELECT action_kind, target_key, mode FROM action_attempt WHERE id = ?", (action_attempt_id,)
+            ).fetchone()
+            if attempt is None:
+                raise ValueError("unknown action attempt")
+            if result.action_kind.value != attempt["action_kind"] or _sanitize_text(result.target_key, "target_key") != attempt["target_key"]:
+                raise ValueError("action result does not match the recorded attempt")
+            if attempt["mode"] == Mode.DRY_RUN.value:
+                raise ValueError("dry_run attempts are simulated and cannot execute")
+            latest = connection.execute(
+                "SELECT state FROM action_transition WHERE action_attempt_id = ? ORDER BY occurred_at DESC, id DESC LIMIT 1",
+                (action_attempt_id,),
+            ).fetchone()
+            previous = None if latest is None else str(latest["state"])
+            allowed = {
+                "planned": {"executing", "precondition_rejected", "failed"},
+                "executing": {"succeeded", "failed", "outcome_unknown"},
+                "succeeded": {"verified", "verification_failed"},
+            }
+            if result.status.value not in allowed.get(previous, set()):
+                raise ValueError(f"illegal action transition from {previous!r} to {result.status.value!r}")
+            transition_id = self._insert_action_transition(
                 connection, action_attempt_id, result.status.value, result.error, result.evidence, _iso(occurred)
             )
+            connection.commit()
+            return transition_id
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def record_snapshot(self, action_attempt_id: int, stage: str, data: Mapping[str, object]) -> int:
         if stage not in {"before", "after"}:
@@ -389,10 +531,10 @@ class SQLiteAuditRepository:
                 """SELECT transition.occurred_at FROM action_transition AS transition
                    JOIN action_attempt AS attempt ON attempt.id = transition.action_attempt_id
                    JOIN anomaly_event AS event ON event.id = attempt.event_id
-                   WHERE event.target_id = ? AND attempt.action_kind = ? AND attempt.target_key = ?
+                   WHERE event.target_id = ? AND attempt.action_kind = ? AND attempt.target_key = ? AND attempt.mode = 'act'
                      AND transition.state = 'succeeded'
                    ORDER BY transition.occurred_at DESC, transition.id DESC LIMIT 1""",
-                (target_id, action_kind.value, target_key),
+                (target_id, action_kind.value, _sanitize_text(target_key, "target_key")),
             ).fetchone()
         return None if row is None else datetime.fromisoformat(str(row["occurred_at"]))
 
@@ -436,7 +578,9 @@ class SQLiteAuditRepository:
 
     def reconcile_orphans(self) -> list[int]:
         """Append ``outcome_unknown`` for attempts interrupted while executing."""
-        with self._connect() as connection:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
             executing = connection.execute(
                 """SELECT attempt.id FROM action_attempt AS attempt
                    WHERE (SELECT state FROM action_transition WHERE action_attempt_id = attempt.id
@@ -448,4 +592,10 @@ class SQLiteAuditRepository:
                 self._insert_action_transition(connection, action_id, "outcome_unknown", None, {
                     "reason": "process restarted while action was executing",
                 })
+            connection.commit()
             return ids
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
