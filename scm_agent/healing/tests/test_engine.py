@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 from typing import Mapping
 import unittest
 
@@ -23,6 +24,7 @@ from scm_agent.healing.models import (
     ConnectionSample,
     Finding,
     HealthSnapshot,
+    IndexTarget,
     IndexStatsSample,
     Mode,
     RuleId,
@@ -125,6 +127,8 @@ class ManualSagaGateway:
         self.execute_count = 0
         self.committed_before_execute = False
         self.interrupt = interrupt
+        self.authorized_plan: ActionPlan | None = None
+        self.executed_plan: ActionPlan | None = None
 
     def _interrupt(self, stage: str) -> None:
         if self.interrupt == stage:
@@ -138,6 +142,21 @@ class ManualSagaGateway:
             return CapabilityDecision(False, "stale_relation_identity")
         return CapabilityDecision(True, "ok")
 
+    def authorize_plan(self, plan: ActionPlan) -> object:
+        decision = self.check_plan(plan)
+        if not decision.allowed:
+            return SimpleNamespace(decision=decision, plan=plan)
+        assert isinstance(plan.target, IndexTarget)
+        target = IndexTarget(
+            plan.target.schema_name,
+            plan.target.index_name,
+            database_oid=17,
+            index_oid=84,
+            parent_relation_oid=42,
+        )
+        self.authorized_plan = replace(plan, target=target, parameters=target.parameters)
+        return SimpleNamespace(decision=decision, plan=self.authorized_plan)
+
     def capture_before(self, plan: ActionPlan) -> Mapping[str, object]:
         self._interrupt("before_capture")
         if self.failure == "before_capture":
@@ -145,6 +164,7 @@ class ManualSagaGateway:
         return {"present": True, "stage": "before"}
 
     def execute(self, plan: ActionPlan) -> ActionResult:
+        self.executed_plan = plan
         self.execute_count += 1
         if self.repository is not None and self.target_id is not None:
             action = self.repository.list_actions(self.target_id)[-1]
@@ -311,6 +331,50 @@ class AuditedManualActionTests(unittest.TestCase):
         self.assertEqual(gateway.execute_count, 1)
         self.assertTrue(gateway.committed_before_execute)
         self.assertEqual(self.repository.list_actions(self.target_id)[0]["state"], "succeeded")
+        self.assertEqual(self._cycle_states(cycle_id), ["started", "completed"])
+
+    def test_manual_reindex_persists_and_executes_the_exact_authorized_oid_plan(self) -> None:
+        cycle_id, gateway, summary = self._run()
+
+        self.assertEqual(summary.status, "succeeded")
+        self.assertIs(gateway.executed_plan, gateway.authorized_plan)
+        assert gateway.authorized_plan is not None
+        self.assertEqual(
+            gateway.authorized_plan.target,
+            IndexTarget("public", "orders_customer_idx", 17, 84, 42),
+        )
+        with self.repository._connect() as connection:
+            plan_json = connection.execute(
+                "SELECT plan_json FROM action_attempt ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+        self.assertIn('"database_oid":17', plan_json)
+        self.assertIn('"index_oid":84', plan_json)
+        self.assertIn('"parent_relation_oid":42', plan_json)
+        self.assertEqual(self._cycle_states(cycle_id), ["started", "completed"])
+
+    def test_allowed_name_only_act_authorization_is_rejected_before_intent(self) -> None:
+        cycle_id, event_id = self._started_event()
+
+        class UnsafeAuthorizationGateway(ManualSagaGateway):
+            def authorize_plan(self, plan: ActionPlan) -> object:
+                return SimpleNamespace(
+                    decision=CapabilityDecision(True, "ok"), plan=plan
+                )
+
+        gateway = UnsafeAuthorizationGateway()
+
+        summary = run_audited_plan(
+            cycle_id,
+            event_id,
+            self.plan,
+            gateway,
+            self.repository,
+            clock=MutableClock(),
+        )
+
+        self.assertEqual(summary.status, "precondition_rejected")
+        self.assertEqual(gateway.execute_count, 0)
+        self.assertEqual(self.repository.list_actions(self.target_id), [])
         self.assertEqual(self._cycle_states(cycle_id), ["started", "completed"])
 
     def test_pre_dispatch_failures_never_execute_and_terminalize_or_remain_recoverable(self) -> None:
@@ -842,11 +906,14 @@ class EngineResilienceTests(unittest.TestCase):
     def test_unexpected_dispatch_exception_is_audited_unknown_and_cycle_completes(self) -> None:
         gateway = RaisingGateway([pressured_snapshot(), pressured_snapshot()], stage="execute")
 
-        _, repository, summary = self._run_twice(gateway)
+        engine, repository, summary = self._run_twice(gateway)
+        immediate_retry = engine.run_once()
 
         target_id = repository.list_targets()[0]["id"]
         self.assertEqual((summary.status, summary.unknown_count), ("completed", 1))
         self.assertEqual(repository.list_actions(target_id)[0]["state"], "outcome_unknown")
+        self.assertEqual(immediate_retry.action_count, 0)
+        self.assertEqual(len(gateway.executed), 1)
 
     def _cycle_states(self, repository: SQLiteAuditRepository) -> list[str]:
         with repository._connect() as connection:
@@ -958,11 +1025,14 @@ class EngineResilienceTests(unittest.TestCase):
             result_status=ActionStatus.OUTCOME_UNKNOWN,
         )
 
-        _, repository, summary = self._run_twice(gateway)
+        engine, repository, summary = self._run_twice(gateway)
+        immediate_retry = engine.run_once()
 
         target_id = repository.list_targets()[0]["id"]
         self.assertEqual((summary.status, summary.unknown_count), ("completed", 1))
         self.assertEqual(repository.list_actions(target_id)[0]["state"], "outcome_unknown")
+        self.assertEqual(immediate_retry.action_count, 0)
+        self.assertEqual(len(gateway.executed), 1)
 
     def test_orphan_recovery_occurs_before_the_first_new_cycle(self) -> None:
         repository = SQLiteAuditRepository(self.path, clock=self.clock)
@@ -996,7 +1066,7 @@ class EngineResilienceTests(unittest.TestCase):
         self.assertEqual(actions[-1]["state"], "outcome_unknown")
         self.assertEqual(action["state"], "succeeded")
 
-    def test_startup_recovers_planned_intent_before_allowing_a_later_cycle_to_act(self) -> None:
+    def test_startup_recovered_planned_intent_blocks_until_cooldown_expiry(self) -> None:
         repository = SQLiteAuditRepository(self.path, clock=self.clock)
         config = self._config()
         target_id = repository.register_target(config.database_dsn, "fixture")
@@ -1011,10 +1081,13 @@ class EngineResilienceTests(unittest.TestCase):
         restarted = HealingEngine(config, gateway, repository, clock=self.clock)
 
         recovery = restarted.run_once()
+        blocked = restarted.run_once()
+        self.clock.value = NOW + config.vacuum_cooldown
         later = restarted.run_once()
 
         actions = repository.list_actions(target_id)
         self.assertEqual((recovery.recovered_orphan_count, recovery.action_count), (1, 0))
+        self.assertEqual(blocked.action_count, 0)
         self.assertEqual(later.action_count, 1)
         self.assertEqual([action["state"] for action in actions], ["outcome_unknown", "succeeded"])
 

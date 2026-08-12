@@ -204,7 +204,9 @@ class DisposableActionLiveTests(unittest.TestCase):
                     confirmed=True,
                 )
                 gateway = PostgresGateway(action_config)
-                result = gateway.execute(plan)
+                authorization = gateway.authorize_plan(plan)
+                self.assertTrue(authorization.decision.allowed)
+                result = gateway.execute(authorization.plan)
                 self.assertEqual(result.status, ActionStatus.SUCCEEDED)
             finally:
                 with setup.cursor() as cursor:

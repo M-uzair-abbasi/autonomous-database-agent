@@ -6,7 +6,7 @@ module-owned constants: callers can supply typed plans, never SQL text.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 import importlib.util
@@ -39,6 +39,14 @@ _HEALER_APPLICATION = "scm-ovs/healer"
 
 class PsycopgUnavailableError(RuntimeError):
     """Raised only when a live PostgreSQL operation needs a missing driver."""
+
+
+@dataclass(frozen=True)
+class PlanAuthorization:
+    """A capability decision paired with the exact immutable authorized plan."""
+
+    decision: "CapabilityDecision"
+    plan: ActionPlan
 
 
 def _driver_is_available() -> bool:
@@ -783,7 +791,7 @@ class PostgresGateway:
             return CapabilityDecision(False, "ineligible_index_state", capability)
         if row.get("is_exclusion") is True:
             return CapabilityDecision(False, "exclusion_index_rejected", capability)
-        if not _has_relation_authority(row):
+        if not _has_index_authority(row):
             has_maintain = False
             if capability.maintain_privilege_supported:
                 privilege = self._fetch_one(
@@ -872,6 +880,54 @@ class PostgresGateway:
                 evidence={"sqlstate": _sqlstate(exc)} if _sqlstate(exc) else {},
             )
 
+    def authorize_plan(self, plan: ActionPlan) -> PlanAuthorization:
+        """Resolve a manual index name to the exact OID-bound plan to persist."""
+
+        policy = self._runtime_policy_decision(plan)
+        if not policy.allowed:
+            return PlanAuthorization(policy, plan)
+        try:
+            with self._connect(_HEALER_APPLICATION, autocommit=True) as connection:
+                self._set_action_timeouts(connection)
+                decision = self._check_plan_on_connection(plan, connection)
+                if not decision.allowed or not isinstance(plan.target, IndexTarget):
+                    return PlanAuthorization(decision, plan)
+                identity = decision.evidence.get("identity")
+                if not isinstance(identity, Mapping):
+                    return PlanAuthorization(
+                        CapabilityDecision(False, "stale_relation_identity"), plan
+                    )
+                try:
+                    target = IndexTarget(
+                        schema_name=plan.target.schema_name,
+                        index_name=plan.target.index_name,
+                        database_oid=_required(identity, "database_oid", int),
+                        index_oid=_required(identity, "index_oid", int),
+                        parent_relation_oid=_required(
+                            identity, "parent_relation_oid", int
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    return PlanAuthorization(
+                        CapabilityDecision(False, "stale_relation_identity"), plan
+                    )
+                authorized = replace(
+                    plan, target=target, parameters=target.parameters
+                )
+                return PlanAuthorization(decision, authorized)
+        except PsycopgUnavailableError:
+            raise
+        except Exception as exc:
+            sqlstate = _sqlstate(exc)
+            return PlanAuthorization(
+                CapabilityDecision(
+                    False,
+                    _reason_for_sqlstate(sqlstate),
+                    evidence={"sqlstate": sqlstate} if sqlstate else {},
+                ),
+                plan,
+            )
+
     def doctor(self) -> Mapping[str, object]:
         """Return live capability facts without echoing DSNs or database errors."""
         if self._connect_function is None and not _driver_is_available():
@@ -952,6 +1008,21 @@ class PostgresGateway:
         policy = self._runtime_policy_decision(plan)
         if not policy.allowed:
             return _decision_result(plan, policy, started, self._clock())
+        if (
+            plan.mode is Mode.ACT
+            and isinstance(plan.target, IndexTarget)
+            and (
+                plan.target.database_oid is None
+                or plan.target.index_oid is None
+                or plan.target.parent_relation_oid is None
+            )
+        ):
+            return _decision_result(
+                plan,
+                CapabilityDecision(False, "unresolved_index_identity"),
+                started,
+                self._clock(),
+            )
         command_attempted = False
         lock_key: int | None = None
         try:
@@ -1092,6 +1163,13 @@ def _has_relation_authority(row: Mapping[str, object]) -> bool:
         row.get("current_is_superuser") is True
         or row.get("owner_oid") == row.get("current_role_oid")
         or row.get("database_owner_oid") == row.get("current_role_oid")
+    )
+
+
+def _has_index_authority(row: Mapping[str, object]) -> bool:
+    return (
+        row.get("current_is_superuser") is True
+        or row.get("owner_oid") == row.get("current_role_oid")
     )
 
 

@@ -137,15 +137,25 @@ python3 -m scm_agent.healing reindex public orders_customer_idx --mode act --con
 - `act` still requires two distinct detections, a current live identity and
   privilege check, a committed audit intent before dispatch, and a maximum of
   one action per cycle.
+- The two-detection gate means two contiguous successful runs of the finding's
+  collector. Failed, unterminated, manual, or dependent-collector-failed cycles
+  break the streak; the second good cycle remains eligible to act.
 - Automatic maintenance is limited to online plain `VACUUM` with
   `SKIP_LOCKED` and `TRUNCATE FALSE`. `VACUUM FULL` is never generated.
 - Reindex is manual-only and concurrent. System schemas, stale identities,
-  unsupported server versions, and missing privileges are rejected.
+  unsupported server versions, and missing privileges are rejected. The
+  authorized database, index, and parent-table OIDs are journaled and must
+  still match immediately before and after the advisory lock. PostgreSQL 12–16
+  requires relation ownership or superuser; PostgreSQL 17+ may also authorize
+  the parent table's MAINTAIN/`pg_maintain` privilege. Database ownership alone
+  is insufficient.
 - Backend termination is off by default and applies only to one exact
   `idle in transaction` session fingerprint. The healer's own backend,
   background workers, superusers, and protected roles are excluded.
 - Every action attempt uses bounded lock/statement timeouts. Successful table
-  vacuuming is rate-limited by the cooldown journal.
+  vacuuming is rate-limited by the cooldown journal. A real VACUUM whose
+  outcome is unknown, including a restart-reconciled orphan, consumes the same
+  cooldown because repeating an uncertain mutation is unsafe.
 - The monitored PostgreSQL schema is not changed by the normal engine. Its
   append-only audit journal lives in the application-owned SQLite file.
 

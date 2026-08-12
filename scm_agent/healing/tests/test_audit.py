@@ -139,6 +139,77 @@ class SQLiteAuditRepositoryTests(unittest.TestCase):
             ["detected", "still_present"],
         )
 
+    def test_current_good_detection_counts_after_one_completed_good_cycle(self) -> None:
+        first_cycle, event_id = self._cycle_with_event()
+        self.repo.finish_cycle(first_cycle, {"tables": True})
+        current_cycle = self.repo.start_cycle(self.target_id, Mode.ACT)
+        self.repo.record_finding(current_cycle, finding(), "tables")
+
+        self.assertEqual(
+            self.repo.consecutive_detection_count(
+                event_id,
+                current_cycle_id=current_cycle,
+                current_collector_succeeded=True,
+            ),
+            2,
+        )
+
+    def test_failed_unterminated_or_dependent_collector_failure_breaks_detection_streak(self) -> None:
+        for interruption in ("failed", "unterminated", "collector_failed"):
+            with self.subTest(interruption=interruption):
+                self.tearDown()
+                self.setUp()
+                first_cycle, event_id = self._cycle_with_event()
+                self.repo.finish_cycle(first_cycle, {"tables": True})
+                broken_cycle = self.repo.start_cycle(self.target_id, Mode.ACT)
+                if interruption == "failed":
+                    self.repo.record_cycle_transition(broken_cycle, "failed", {})
+                elif interruption == "collector_failed":
+                    self.repo.finish_cycle(broken_cycle, {"tables": False})
+                current_cycle = self.repo.start_cycle(self.target_id, Mode.ACT)
+                self.repo.record_finding(current_cycle, finding(), "tables")
+
+                count = self.repo.consecutive_detection_count(
+                    event_id,
+                    current_cycle_id=current_cycle,
+                    current_collector_succeeded=True,
+                )
+
+                self.assertEqual(count, 1)
+
+    def test_irrelevant_collector_failure_does_not_break_relevant_streak(self) -> None:
+        first_cycle, event_id = self._cycle_with_event()
+        self.repo.finish_cycle(first_cycle, {"tables": True, "activity": False})
+        current_cycle = self.repo.start_cycle(self.target_id, Mode.ACT)
+        self.repo.record_finding(current_cycle, finding(), "tables")
+
+        self.assertEqual(
+            self.repo.consecutive_detection_count(
+                event_id,
+                current_cycle_id=current_cycle,
+                current_collector_succeeded=True,
+            ),
+            2,
+        )
+
+    def test_manual_cycle_and_duplicate_cycle_transitions_do_not_inflate_streak(self) -> None:
+        first_cycle, event_id = self._cycle_with_event()
+        self.repo.finish_cycle(first_cycle, {"tables": True})
+        self.repo.record_cycle_transition(first_cycle, "completed", {"collectors": {"tables": True}})
+        manual_cycle = self.repo.start_cycle(self.target_id, Mode.ACT)
+        self.repo.record_cycle_transition(manual_cycle, "completed", {"collectors": {}})
+        current_cycle = self.repo.start_cycle(self.target_id, Mode.ACT)
+        self.repo.record_finding(current_cycle, finding(), "tables")
+
+        self.assertEqual(
+            self.repo.consecutive_detection_count(
+                event_id,
+                current_cycle_id=current_cycle,
+                current_collector_succeeded=True,
+            ),
+            1,
+        )
+
     def test_failed_dependent_collector_does_not_clear_an_event(self) -> None:
         cycle_id, event_id = self._cycle_with_event()
         self.repo.finish_cycle(cycle_id, {"tables": True, "activities": True})
@@ -201,7 +272,14 @@ class SQLiteAuditRepositoryTests(unittest.TestCase):
         cycle_id, event_id = self._cycle_with_event()
         self.assertEqual(self.repo.record_finding(cycle_id, finding(), "tables"), event_id)
 
-        self.assertEqual(self.repo.consecutive_detection_count(event_id), 1)
+        self.assertEqual(
+            self.repo.consecutive_detection_count(
+                event_id,
+                current_cycle_id=cycle_id,
+                current_collector_succeeded=True,
+            ),
+            1,
+        )
         self.assertEqual(len(self.repo.list_events(self.target_id)[0]["transitions"]), 1)
 
     def test_atomic_acquisition_checks_cooldown_and_active_target_lease(self) -> None:
@@ -227,6 +305,152 @@ class SQLiteAuditRepositoryTests(unittest.TestCase):
 
         self.assertEqual(cooldown.status, "cooldown")
         self.assertEqual(cooldown.cooldown_until, NOW + timedelta(hours=6, seconds=2))
+
+    def test_unknown_real_vacuum_consumes_cooldown_until_expiry(self) -> None:
+        _, event_id = self._cycle_with_event()
+        acquired = self.repo.acquire_action_intent(
+            event_id, plan(), "unknown-real", timedelta(hours=6)
+        )
+        assert acquired.action_id is not None
+        self.repo.record_action_result(
+            acquired.action_id,
+            ActionResult(ActionKind.VACUUM, ActionStatus.EXECUTING, "17:42", NOW),
+        )
+        self.repo.record_action_result(
+            acquired.action_id,
+            ActionResult(
+                ActionKind.VACUUM,
+                ActionStatus.OUTCOME_UNKNOWN,
+                "17:42",
+                NOW,
+                NOW + timedelta(seconds=3),
+            ),
+        )
+
+        blocked = self.repo.acquire_action_intent(
+            event_id, plan(), "unknown-retry", timedelta(hours=6)
+        )
+        self.assertEqual(blocked.status, "cooldown")
+        self.assertEqual(blocked.cooldown_until, NOW + timedelta(hours=6, seconds=3))
+
+        self.repo.clock.value = NOW + timedelta(hours=6, seconds=3)
+        allowed = self.repo.acquire_action_intent(
+            event_id, plan(), "unknown-after-expiry", timedelta(hours=6)
+        )
+        self.assertEqual(allowed.status, "acquired")
+
+    def test_verified_success_still_consumes_the_real_vacuum_cooldown(self) -> None:
+        _, event_id = self._cycle_with_event()
+        acquired = self.repo.acquire_action_intent(event_id, plan(), "verified-real", None)
+        assert acquired.action_id is not None
+        self.repo.record_action_result(
+            acquired.action_id,
+            ActionResult(ActionKind.VACUUM, ActionStatus.EXECUTING, "17:42", NOW),
+        )
+        self.repo.record_action_result(
+            acquired.action_id,
+            ActionResult(ActionKind.VACUUM, ActionStatus.SUCCEEDED, "17:42", NOW, NOW),
+        )
+        self.repo.record_action_result(
+            acquired.action_id,
+            ActionResult(ActionKind.VACUUM, ActionStatus.VERIFIED, "17:42", NOW, NOW),
+        )
+
+        blocked = self.repo.acquire_action_intent(
+            event_id, plan(), "verified-retry", timedelta(hours=6)
+        )
+
+        self.assertEqual(blocked.status, "cooldown")
+
+    def test_reconciled_planned_and_executing_vacuums_consume_cooldown_after_restart(self) -> None:
+        for state in ("planned", "executing"):
+            with self.subTest(state=state):
+                self.tearDown()
+                self.setUp()
+                _, event_id = self._cycle_with_event()
+                acquired = self.repo.acquire_action_intent(
+                    event_id, plan(), f"orphan-{state}", timedelta(hours=6)
+                )
+                assert acquired.action_id is not None
+                if state == "executing":
+                    self.repo.record_action_result(
+                        acquired.action_id,
+                        ActionResult(
+                            ActionKind.VACUUM, ActionStatus.EXECUTING, "17:42", NOW
+                        ),
+                    )
+                restarted = SQLiteAuditRepository(self.path, clock=FixedClock())
+
+                self.assertEqual(restarted.reconcile_orphans(), [acquired.action_id])
+                blocked = restarted.acquire_action_intent(
+                    event_id, plan(), f"restart-{state}", timedelta(hours=6)
+                )
+                self.assertEqual(blocked.status, "cooldown")
+
+    def test_unknown_cooldown_is_atomic_across_repositories(self) -> None:
+        _, event_id = self._cycle_with_event()
+        acquired = self.repo.acquire_action_intent(event_id, plan(), "unknown-race", None)
+        assert acquired.action_id is not None
+        self.repo.record_action_result(
+            acquired.action_id,
+            ActionResult(ActionKind.VACUUM, ActionStatus.EXECUTING, "17:42", NOW),
+        )
+        self.repo.record_action_result(
+            acquired.action_id,
+            ActionResult(
+                ActionKind.VACUUM, ActionStatus.OUTCOME_UNKNOWN, "17:42", NOW, NOW
+            ),
+        )
+        barrier = threading.Barrier(2)
+        results: list[str] = []
+
+        def contend(key: str) -> None:
+            repository = SQLiteAuditRepository(self.path, clock=FixedClock())
+            barrier.wait()
+            results.append(
+                repository.acquire_action_intent(
+                    event_id, plan(), key, timedelta(hours=6)
+                ).status
+            )
+
+        threads = [threading.Thread(target=contend, args=(f"unknown-{index}",)) for index in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(results, ["cooldown", "cooldown"])
+
+    def test_dry_run_unknown_failed_and_precondition_rejected_do_not_consume_cooldown(self) -> None:
+        _, event_id = self._cycle_with_event()
+        for offset, status in enumerate(
+            (ActionStatus.FAILED, ActionStatus.PRECONDITION_REJECTED), start=1
+        ):
+            action = self.repo.acquire_action_intent(
+                event_id, plan(), f"nonblocking-{offset}", None
+            )
+            assert action.action_id is not None
+            self.repo.record_action_result(
+                action.action_id,
+                ActionResult(ActionKind.VACUUM, ActionStatus.EXECUTING, "17:42", NOW),
+            )
+            self.repo.record_action_result(
+                action.action_id,
+                ActionResult(ActionKind.VACUUM, status, "17:42", NOW, NOW),
+            )
+        dry = self.repo.acquire_action_intent(
+            event_id, plan(mode=Mode.DRY_RUN), "dry-unknown-fixture", None
+        )
+        assert dry.action_id is not None
+        with self.repo._connect() as connection:
+            self.repo._insert_action_transition(
+                connection, dry.action_id, "outcome_unknown", None, {}
+            )
+
+        retry = self.repo.acquire_action_intent(
+            event_id, plan(), "after-nonblocking", timedelta(hours=6)
+        )
+        self.assertEqual(retry.status, "acquired")
 
     def test_dry_run_cannot_transition_to_execution_or_success(self) -> None:
         _, event_id = self._cycle_with_event()
@@ -308,7 +532,7 @@ class SQLiteAuditRepositoryTests(unittest.TestCase):
         self.assertEqual(reopened.reconcile_orphans(), [action_id])
         self.assertEqual(reopened.list_actions(self.target_id)[0]["state"], "outcome_unknown")
 
-    def test_recovery_marks_a_planned_act_attempt_unknown_and_releases_its_lease(self) -> None:
+    def test_recovery_marks_a_planned_act_attempt_unknown_and_starts_cooldown(self) -> None:
         _, event_id = self._cycle_with_event()
         action_id = self.repo.record_action_intent(event_id, plan(), "planned-orphan")
         assert action_id is not None
@@ -320,7 +544,7 @@ class SQLiteAuditRepositoryTests(unittest.TestCase):
         retry = reopened.acquire_action_intent(
             event_id, plan(), "after-planned-orphan", timedelta(hours=6)
         )
-        self.assertEqual(retry.status, "acquired")
+        self.assertEqual(retry.status, "cooldown")
 
     def test_recovery_never_changes_a_dry_run_simulation(self) -> None:
         _, event_id = self._cycle_with_event()

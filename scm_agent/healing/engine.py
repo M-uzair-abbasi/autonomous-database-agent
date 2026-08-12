@@ -18,10 +18,11 @@ from .models import (
     ActionStatus,
     Finding,
     HealthSnapshot,
+    IndexTarget,
     Mode,
     RuleId,
 )
-from .postgres import CapabilityDecision
+from .postgres import CapabilityDecision, PlanAuthorization
 from .rules import detect_all
 
 
@@ -29,6 +30,8 @@ class HealthGateway(Protocol):
     def collect_health(self) -> HealthSnapshot: ...
 
     def check_plan(self, plan: ActionPlan) -> CapabilityDecision: ...
+
+    def authorize_plan(self, plan: ActionPlan) -> PlanAuthorization: ...
 
     def capture_before(self, plan: ActionPlan) -> Mapping[str, object]: ...
 
@@ -46,7 +49,13 @@ class AuditRepository(Protocol):
 
     def record_finding(self, cycle_id: int, item: Finding, collector: str) -> int: ...
 
-    def consecutive_detection_count(self, event_id: int) -> int: ...
+    def consecutive_detection_count(
+        self,
+        event_id: int,
+        *,
+        current_cycle_id: int | None = None,
+        current_collector_succeeded: bool = False,
+    ) -> int: ...
 
     def acquire_action_intent(
         self,
@@ -222,7 +231,22 @@ def run_audited_plan(
     reconciliation. This helper owns every live/action stage after correlation.
     """
     try:
-        decision = gateway.check_plan(plan)
+        if isinstance(plan.target, IndexTarget):
+            authorization = gateway.authorize_plan(plan)
+            decision = authorization.decision
+            if decision.allowed:
+                plan = authorization.plan
+                if (
+                    not isinstance(plan.target, IndexTarget)
+                    or plan.target.database_oid is None
+                    or plan.target.index_oid is None
+                    or plan.target.parent_relation_oid is None
+                ):
+                    decision = CapabilityDecision(
+                        False, "unresolved_index_identity"
+                    )
+        else:
+            decision = gateway.check_plan(plan)
     except BaseException as error:
         cycle_status = _terminalize_plan_cycle(
             audit, cycle_id, failed=True, reason="capability_check_failed"
@@ -476,11 +500,13 @@ class HealingEngine:
         findings = detect_all(detection_snapshot, self._config.policy)
 
         correlated: list[tuple[Finding, int]] = []
+        event_collectors: dict[int, str] = {}
         for finding in findings:
             event_id = self._audit.record_finding(
                 cycle_id, finding, _RULE_COLLECTOR[finding.rule_id]
             )
             correlated.append((finding, event_id))
+            event_collectors[event_id] = _RULE_COLLECTOR[finding.rule_id]
 
         planned: list[tuple[ActionPlan, int]] = []
         for finding, event_id in correlated:
@@ -504,7 +530,12 @@ class HealingEngine:
             if action_count >= 1:
                 break
             required_detections = max(2, self._config.required_consecutive_detections)
-            if self._audit.consecutive_detection_count(event_id) < required_detections:
+            collector = event_collectors[event_id]
+            if self._audit.consecutive_detection_count(
+                event_id,
+                current_cycle_id=cycle_id,
+                current_collector_succeeded=collector_statuses[collector],
+            ) < required_detections:
                 skipped += 1
                 continue
             decision = self._gateway.check_plan(plan)

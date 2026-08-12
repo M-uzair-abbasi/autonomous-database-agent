@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from io import StringIO
 import json
@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 from scm_agent.healing import cli
@@ -22,6 +23,7 @@ from scm_agent.healing.models import (
     ActionResult,
     ActionStatus,
     Finding,
+    IndexTarget,
     Mode,
     RuleId,
     Severity,
@@ -337,6 +339,16 @@ class CliTests(unittest.TestCase):
                         "SELECT COUNT(*) FROM poll_cycle"
                     ).fetchone()[0] == 1
                 return CapabilityDecision(True, "ok")
+
+            def authorize_plan(self, plan: object) -> object:
+                decision = self.check_plan(plan)
+                target = IndexTarget(
+                    "public", "orders_customer_idx", 17, 84, 42
+                )
+                return SimpleNamespace(
+                    decision=decision,
+                    plan=replace(plan, target=target, parameters=target.parameters),
+                )
 
             def capture_before(self, plan: object) -> dict[str, object]:
                 return {"present": True}

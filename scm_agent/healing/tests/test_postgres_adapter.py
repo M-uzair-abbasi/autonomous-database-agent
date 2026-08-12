@@ -189,8 +189,12 @@ def table_plan(*, mode: Mode = Mode.ACT) -> ActionPlan:
     )
 
 
-def index_plan(*, mode: Mode = Mode.ACT) -> ActionPlan:
-    target = IndexTarget("public", "orders_customer_idx")
+def index_plan(*, mode: Mode = Mode.ACT, enriched: bool = False) -> ActionPlan:
+    target = (
+        IndexTarget("public", "orders_customer_idx", 17, 84, 42)
+        if enriched
+        else IndexTarget("public", "orders_customer_idx")
+    )
     return ActionPlan(
         ActionKind.REINDEX_INDEX,
         "index-fingerprint",
@@ -596,6 +600,114 @@ class ActionGateTests(unittest.TestCase):
         decision = gateway.check_plan(index_plan())
 
         self.assertEqual((decision.allowed, decision.reason), (True, "ok"))
+
+    def test_reindex_privilege_excludes_database_ownership_on_pg16(self) -> None:
+        database_owned = index_identity(
+            owner_oid=30, current_role_oid=10, database_owner_oid=10
+        )
+        relation_owned = index_identity(
+            owner_oid=10, current_role_oid=10, database_owner_oid=20
+        )
+        superuser = index_identity(
+            owner_oid=30,
+            current_role_oid=10,
+            database_owner_oid=20,
+            current_is_superuser=True,
+        )
+
+        denied, _ = self._gateway(
+            target_marker="scm-ovs:index-target", target_row=database_owned
+        )
+        owner, _ = self._gateway(
+            target_marker="scm-ovs:index-target", target_row=relation_owned
+        )
+        root, _ = self._gateway(
+            target_marker="scm-ovs:index-target", target_row=superuser
+        )
+
+        self.assertEqual(
+            (denied.check_plan(index_plan()).allowed, denied.check_plan(index_plan()).reason),
+            (False, "insufficient_privilege"),
+        )
+        self.assertTrue(owner.check_plan(index_plan()).allowed)
+        self.assertTrue(root.check_plan(index_plan()).allowed)
+
+    def test_pg17_reindex_maintain_authority_is_checked_on_parent_table(self) -> None:
+        unowned = index_identity(owner_oid=30, current_role_oid=10, database_owner_oid=10)
+        denied, _ = self._gateway(
+            target_marker="scm-ovs:index-target",
+            target_row=unowned,
+            facts=server_facts(version=170000),
+            extra={"scm-ovs:maintain-privilege": [{"has_maintain": False}]},
+        )
+        allowed, connector = self._gateway(
+            target_marker="scm-ovs:index-target",
+            target_row=unowned,
+            facts=server_facts(version=170000),
+            extra={
+                "scm-ovs:maintain-privilege": lambda parameters: [
+                    {"has_maintain": parameters == (42,)}
+                ]
+            },
+        )
+
+        self.assertEqual(
+            (denied.check_plan(index_plan()).allowed, denied.check_plan(index_plan()).reason),
+            (False, "insufficient_privilege"),
+        )
+        self.assertTrue(allowed.check_plan(index_plan()).allowed)
+        self.assertEqual(len(connector.connection_options), 1)
+
+    def test_manual_authorization_returns_oid_bound_immutable_plan(self) -> None:
+        gateway, _ = self._gateway(
+            target_marker="scm-ovs:index-target", target_row=index_identity()
+        )
+        requested = index_plan()
+
+        authorization = gateway.authorize_plan(requested)
+
+        self.assertTrue(authorization.decision.allowed)
+        self.assertIsNot(authorization.plan, requested)
+        self.assertEqual(
+            authorization.plan.target,
+            IndexTarget("public", "orders_customer_idx", 17, 84, 42),
+        )
+        self.assertEqual(
+            dict(authorization.plan.parameters),
+            {
+                "schema": "public",
+                "index": "orders_customer_idx",
+                "database_oid": 17,
+                "index_oid": 84,
+                "parent_relation_oid": 42,
+            },
+        )
+
+    def test_act_execute_rejects_name_only_index_and_replacement_after_authorization(self) -> None:
+        gateway, connector = self._gateway(
+            target_marker="scm-ovs:index-target",
+            target_row=index_identity(),
+            extra={
+                "scm-ovs:index-target": RouteSequence(
+                    [index_identity()],
+                    [index_identity(index_oid=85)],
+                ),
+                "REINDEX INDEX CONCURRENTLY": AssertionError(
+                    "replacement index was reindexed"
+                ),
+            },
+        )
+
+        name_only = gateway.execute(index_plan())
+        authorization = gateway.authorize_plan(index_plan())
+        replacement = gateway.execute(authorization.plan)
+
+        self.assertEqual(name_only.status, ActionStatus.PRECONDITION_REJECTED)
+        self.assertEqual(name_only.evidence["reason"], "unresolved_index_identity")
+        self.assertTrue(authorization.decision.allowed)
+        self.assertEqual(replacement.status, ActionStatus.PRECONDITION_REJECTED)
+        self.assertEqual(replacement.evidence["reason"], "stale_relation_identity")
+        self.assertEqual(len(connector.connection_options), 2)
 
     def test_backend_full_fingerprint_and_protection_gates(self) -> None:
         cases = (

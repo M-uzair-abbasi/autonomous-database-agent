@@ -370,19 +370,73 @@ class SQLiteAuditRepository:
                 "collectors": dict(collector_statuses),
             })
 
-    def consecutive_detection_count(self, event_id: int) -> int:
+    def consecutive_detection_count(
+        self,
+        event_id: int,
+        *,
+        current_cycle_id: int | None = None,
+        current_collector_succeeded: bool = False,
+    ) -> int:
+        """Count the contiguous successful-collection detection streak.
+
+        A currently running engine cycle may be counted provisionally only
+        when its dependent collector succeeded. Older cycles must have a
+        terminal completed transition whose collector detail explicitly says
+        that same collector succeeded.
+        """
         with self._connect() as connection:
-            last_clear = connection.execute(
-                "SELECT id FROM event_transition WHERE event_id = ? AND state = 'cleared' ORDER BY occurred_at DESC, id DESC LIMIT 1",
+            event = connection.execute(
+                "SELECT target_id, collector FROM anomaly_event WHERE id = ?",
                 (event_id,),
             ).fetchone()
-            after_transition = 0 if last_clear is None else int(last_clear["id"])
-            row = connection.execute(
-                """SELECT COUNT(DISTINCT cycle_id) AS count FROM event_transition
-                   WHERE event_id = ? AND id > ? AND state IN ('detected', 'still_present')""",
-                (event_id, after_transition),
+            if event is None:
+                raise ValueError("unknown anomaly event")
+            last_clear = connection.execute(
+                """SELECT cycle_id FROM event_transition
+                   WHERE event_id = ? AND state = 'cleared'
+                   ORDER BY id DESC LIMIT 1""",
+                (event_id,),
             ).fetchone()
-        return int(row["count"])
+            after_cycle = 0 if last_clear is None else int(last_clear["cycle_id"])
+            cycles = connection.execute(
+                """SELECT id FROM poll_cycle
+                   WHERE target_id = ? AND id > ?
+                   ORDER BY id DESC""",
+                (event["target_id"], after_cycle),
+            ).fetchall()
+            count = 0
+            for cycle in cycles:
+                cycle_id = int(cycle["id"])
+                detected = connection.execute(
+                    """SELECT 1 FROM event_transition
+                       WHERE event_id = ? AND cycle_id = ?
+                         AND state IN ('detected', 'still_present')
+                       LIMIT 1""",
+                    (event_id, cycle_id),
+                ).fetchone()
+                if current_cycle_id is not None and cycle_id == current_cycle_id:
+                    if current_collector_succeeded and detected is not None:
+                        count += 1
+                        continue
+                    break
+                transition = connection.execute(
+                    """SELECT state, detail_json FROM cycle_transition
+                       WHERE cycle_id = ? ORDER BY id DESC LIMIT 1""",
+                    (cycle_id,),
+                ).fetchone()
+                if transition is None or transition["state"] != "completed":
+                    break
+                try:
+                    detail = json.loads(str(transition["detail_json"]))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    break
+                collectors = detail.get("collectors") if isinstance(detail, dict) else None
+                if not isinstance(collectors, dict) or collectors.get(event["collector"]) is not True:
+                    break
+                if detected is None:
+                    break
+                count += 1
+        return count
 
     def acquire_action_intent(
         self,
@@ -423,7 +477,7 @@ class SQLiteAuditRepository:
                        WHERE event.target_id = ? AND attempt.action_kind = ? AND attempt.target_key = ?
                          AND attempt.mode = 'act'
                          AND (SELECT state FROM action_transition
-                              WHERE action_attempt_id = attempt.id ORDER BY occurred_at DESC, id DESC LIMIT 1)
+                              WHERE action_attempt_id = attempt.id ORDER BY id DESC LIMIT 1)
                              IN ('planned', 'executing')
                        ORDER BY attempt.id LIMIT 1""",
                     (event["target_id"], item.action_kind.value, _sanitize_text(item.target_key, "target_key")),
@@ -432,17 +486,27 @@ class SQLiteAuditRepository:
                     connection.commit()
                     return ActionIntentAcquisition("duplicate")
                 if cooldown is not None:
-                    succeeded = connection.execute(
+                    terminal = connection.execute(
                         """SELECT transition.occurred_at FROM action_transition AS transition
                            JOIN action_attempt AS attempt ON attempt.id = transition.action_attempt_id
                            JOIN anomaly_event AS prior_event ON prior_event.id = attempt.event_id
                            WHERE prior_event.target_id = ? AND attempt.action_kind = ? AND attempt.target_key = ?
-                             AND attempt.mode = 'act' AND transition.state = 'succeeded'
+                             AND attempt.mode = 'act'
+                             AND transition.id = (
+                                 SELECT latest.id FROM action_transition AS latest
+                                 WHERE latest.action_attempt_id = attempt.id
+                                   AND latest.state IN (
+                                       'succeeded', 'outcome_unknown',
+                                       'failed', 'precondition_rejected'
+                                   )
+                                 ORDER BY latest.id DESC LIMIT 1
+                             )
+                             AND transition.state IN ('succeeded', 'outcome_unknown')
                            ORDER BY transition.occurred_at DESC, transition.id DESC LIMIT 1""",
                         (event["target_id"], item.action_kind.value, _sanitize_text(item.target_key, "target_key")),
                     ).fetchone()
-                    if succeeded is not None:
-                        cooldown_until = datetime.fromisoformat(str(succeeded["occurred_at"])) + cooldown
+                    if terminal is not None:
+                        cooldown_until = datetime.fromisoformat(str(terminal["occurred_at"])) + cooldown
                         if self.clock() < cooldown_until:
                             connection.commit()
                             return ActionIntentAcquisition("cooldown", cooldown_until=cooldown_until)
@@ -508,7 +572,7 @@ class SQLiteAuditRepository:
             if attempt["mode"] == Mode.DRY_RUN.value:
                 raise ValueError("dry_run attempts are simulated and cannot execute")
             latest = connection.execute(
-                "SELECT state FROM action_transition WHERE action_attempt_id = ? ORDER BY occurred_at DESC, id DESC LIMIT 1",
+                "SELECT state FROM action_transition WHERE action_attempt_id = ? ORDER BY id DESC LIMIT 1",
                 (action_attempt_id,),
             ).fetchone()
             previous = None if latest is None else str(latest["state"])
@@ -580,7 +644,7 @@ class SQLiteAuditRepository:
             listed: list[dict[str, object]] = []
             for attempt in attempts:
                 transitions = [dict(row) for row in connection.execute(
-                    "SELECT id, state, occurred_at, error, detail_json FROM action_transition WHERE action_attempt_id = ? ORDER BY occurred_at, id",
+                    "SELECT id, state, occurred_at, error, detail_json FROM action_transition WHERE action_attempt_id = ? ORDER BY id",
                     (attempt["id"],),
                 )]
                 snapshots = [dict(row) for row in connection.execute(
@@ -599,11 +663,11 @@ class SQLiteAuditRepository:
             orphaned = connection.execute(
                 """SELECT attempt.id,
                           (SELECT state FROM action_transition WHERE action_attempt_id = attempt.id
-                           ORDER BY occurred_at DESC, id DESC LIMIT 1) AS state
+                           ORDER BY id DESC LIMIT 1) AS state
                    FROM action_attempt AS attempt
                    WHERE attempt.mode = 'act'
                      AND (SELECT state FROM action_transition WHERE action_attempt_id = attempt.id
-                          ORDER BY occurred_at DESC, id DESC LIMIT 1) IN ('planned', 'executing')
+                          ORDER BY id DESC LIMIT 1) IN ('planned', 'executing')
                    ORDER BY attempt.id"""
             ).fetchall()
             ids = [int(row["id"]) for row in orphaned]
