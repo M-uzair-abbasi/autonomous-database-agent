@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import subprocess
+import textwrap
 from typing import Mapping
 import unittest
 
@@ -226,17 +229,44 @@ def backend_plan() -> ActionPlan:
 
 
 class LazyDriverAndSqlContractTests(unittest.TestCase):
-    def test_module_import_does_not_import_psycopg(self) -> None:
-        self.assertNotIn("psycopg", sys.modules)
+    def test_isolated_import_is_lazy_and_live_load_has_safe_driver_error(self) -> None:
+        project_root = Path(__file__).resolve().parents[3]
+        script = textwrap.dedent(
+            """
+            import builtins
 
-    def test_missing_driver_error_contains_only_safe_install_guidance(self) -> None:
-        if postgres._driver_is_available():
-            self.skipTest("psycopg is installed in this interpreter")
+            attempted = []
+            real_import = builtins.__import__
 
-        with self.assertRaises(postgres.PsycopgUnavailableError) as raised:
-            postgres._load_psycopg()
+            def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
+                if name == "psycopg" or name.startswith("psycopg."):
+                    attempted.append(name)
+                    raise ImportError("forced missing psycopg for lazy-import contract")
+                return real_import(name, globals, locals, fromlist, level)
 
-        self.assertIn('pip install "psycopg[binary]"', str(raised.exception))
+            builtins.__import__ = blocked_import
+            import scm_agent.healing.postgres as postgres
+            assert attempted == [], attempted
+
+            try:
+                postgres._load_psycopg()
+            except postgres.PsycopgUnavailableError as error:
+                assert 'pip install "psycopg[binary]"' in str(error)
+            else:
+                raise AssertionError("live driver load did not fail safely")
+            assert attempted == ["psycopg"], attempted
+            """
+        )
+
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=project_root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_activity_collector_is_catalog_qualified_and_excludes_self_and_workers(self) -> None:
         normalized = " ".join(postgres.ACTIVITY_SQL.lower().split())
@@ -396,9 +426,100 @@ class ActionGateTests(unittest.TestCase):
             routes.update(extra)
         connector = FakeConnector(routes)
         gateway = postgres.PostgresGateway(
-            config or HealingConfig(mode=Mode.ACT), connect=connector, clock=lambda: NOW
+            config or HealingConfig(
+                mode=Mode.ACT,
+                allow_terminate_idle_transaction=True,
+                allow_manual_reindex=True,
+            ),
+            connect=connector,
+            clock=lambda: NOW,
         )
         return gateway, connector
+
+    def test_runtime_observe_rejects_stale_act_plan_before_database_io(self) -> None:
+        gateway, connector = self._gateway(
+            target_marker="scm-ovs:table-target",
+            target_row=table_identity(),
+            config=HealingConfig(mode=Mode.OBSERVE),
+            extra={"VACUUM (": AssertionError("observe gateway dispatched VACUUM")},
+        )
+
+        decision = gateway.check_plan(table_plan(mode=Mode.ACT))
+        result = gateway.execute(table_plan(mode=Mode.ACT))
+
+        self.assertEqual((decision.allowed, decision.reason), (False, "gateway_observe_mode"))
+        self.assertEqual(result.status, ActionStatus.PRECONDITION_REJECTED)
+        self.assertEqual(result.evidence["reason"], "gateway_observe_mode")
+        self.assertEqual(connector.connection_options, [])
+
+    def test_runtime_dry_run_rejects_stale_act_plan_before_database_io(self) -> None:
+        gateway, connector = self._gateway(
+            target_marker="scm-ovs:table-target",
+            target_row=table_identity(),
+            config=HealingConfig(mode=Mode.DRY_RUN),
+            extra={"VACUUM (": AssertionError("dry-run gateway dispatched VACUUM")},
+        )
+
+        decision = gateway.check_plan(table_plan(mode=Mode.ACT))
+        result = gateway.execute(table_plan(mode=Mode.ACT))
+
+        self.assertEqual((decision.allowed, decision.reason), (False, "gateway_mode_mismatch"))
+        self.assertEqual(result.status, ActionStatus.PRECONDITION_REJECTED)
+        self.assertEqual(result.evidence["reason"], "gateway_mode_mismatch")
+        self.assertEqual(connector.connection_options, [])
+
+    def test_runtime_act_rejects_dry_run_plan_before_database_io(self) -> None:
+        gateway, connector = self._gateway(
+            target_marker="scm-ovs:table-target",
+            target_row=table_identity(),
+            config=HealingConfig(mode=Mode.ACT),
+            extra={"VACUUM (": AssertionError("act gateway accepted stale dry-run plan")},
+        )
+
+        decision = gateway.check_plan(table_plan(mode=Mode.DRY_RUN))
+        result = gateway.execute(table_plan(mode=Mode.DRY_RUN))
+
+        self.assertEqual((decision.allowed, decision.reason), (False, "gateway_mode_mismatch"))
+        self.assertEqual(result.status, ActionStatus.PRECONDITION_REJECTED)
+        self.assertEqual(result.evidence["reason"], "gateway_mode_mismatch")
+        self.assertEqual(connector.connection_options, [])
+
+    def test_disabled_high_risk_flags_reject_stale_plans_before_database_io(self) -> None:
+        cases = (
+            (backend_plan(), "terminate_backend_disabled", "scm-ovs:terminate-backend"),
+            (index_plan(), "manual_reindex_disabled", "REINDEX INDEX CONCURRENTLY"),
+        )
+        for plan, reason, action_marker in cases:
+            with self.subTest(action=plan.action_kind.value):
+                gateway, connector = self._gateway(
+                    target_marker="scm-ovs:backend-target",
+                    target_row=backend_identity(),
+                    config=HealingConfig(mode=Mode.ACT),
+                    extra={action_marker: AssertionError("disabled action SQL was dispatched")},
+                )
+
+                decision = gateway.check_plan(plan)
+                result = gateway.execute(plan)
+
+                self.assertEqual((decision.allowed, decision.reason), (False, reason))
+                self.assertEqual(result.status, ActionStatus.PRECONDITION_REJECTED)
+                self.assertEqual(result.evidence["reason"], reason)
+                self.assertEqual(connector.connection_options, [])
+
+    def test_policy_denial_is_structured_and_does_not_leak_dsn(self) -> None:
+        dsn = "postgresql://scm:top-secret@localhost:5434/scm_demo"
+        gateway = postgres.PostgresGateway(
+            HealingConfig(database_dsn=dsn, mode=Mode.OBSERVE),
+            connect=FakeConnector({}),
+            clock=lambda: NOW,
+        )
+
+        decision = gateway.check_plan(table_plan())
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "gateway_observe_mode")
+        self.assertNotIn("top-secret", repr(decision))
+        self.assertNotIn(dsn, repr(decision))
 
     def test_relation_identity_type_and_persistence_changes_are_rejected(self) -> None:
         cases = (
@@ -530,6 +651,7 @@ class ActionGateTests(unittest.TestCase):
         gateway, _ = self._gateway(
             target_marker="scm-ovs:table-target",
             target_row=table_identity(),
+            config=HealingConfig(mode=Mode.DRY_RUN),
             extra={"VACUUM (": AssertionError("dry-run executed VACUUM")},
         )
 

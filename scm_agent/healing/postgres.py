@@ -829,8 +829,36 @@ class PostgresGateway:
             return CapabilityDecision(False, "unsafe_backend_state", capability)
         return CapabilityDecision(True, "ok", capability, {"identity": expected})
 
+    def _runtime_policy_decision(self, plan: ActionPlan) -> CapabilityDecision:
+        """Reconcile a persisted plan with the gateway's current safe policy."""
+        if self._config.mode is Mode.OBSERVE:
+            return CapabilityDecision(False, "gateway_observe_mode")
+        if plan.mode is not self._config.mode:
+            return CapabilityDecision(
+                False,
+                "gateway_mode_mismatch",
+                evidence={
+                    "gateway_mode": self._config.mode.value,
+                    "plan_mode": plan.mode.value,
+                },
+            )
+        if (
+            plan.action_kind is ActionKind.TERMINATE_BACKEND
+            and not self._config.allow_terminate_idle_transaction
+        ):
+            return CapabilityDecision(False, "terminate_backend_disabled")
+        if (
+            plan.action_kind is ActionKind.REINDEX_INDEX
+            and not self._config.allow_manual_reindex
+        ):
+            return CapabilityDecision(False, "manual_reindex_disabled")
+        return CapabilityDecision(True, "ok")
+
     def check_plan(self, plan: ActionPlan) -> CapabilityDecision:
         """Check capabilities and the complete live target identity without acting."""
+        policy = self._runtime_policy_decision(plan)
+        if not policy.allowed:
+            return policy
         try:
             with self._connect(_HEALER_APPLICATION, autocommit=True) as connection:
                 self._set_action_timeouts(connection)
@@ -921,6 +949,9 @@ class PostgresGateway:
     def execute(self, plan: ActionPlan) -> ActionResult:
         """Revalidate, serialize, and execute one fixed action on autocommit."""
         started = self._clock()
+        policy = self._runtime_policy_decision(plan)
+        if not policy.allowed:
+            return _decision_result(plan, policy, started, self._clock())
         command_attempted = False
         lock_key: int | None = None
         try:
