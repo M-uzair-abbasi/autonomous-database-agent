@@ -144,11 +144,23 @@ def _terminalize_plan_cycle(
 ) -> str:
     if not failed:
         try:
-            audit.finish_cycle(cycle_id, {"indexes": True})
+            # A manual action did not run a collector, so it must not claim a
+            # collector success that could clear an unrelated anomaly event.
+            audit.finish_cycle(cycle_id, {})
             return "completed"
-        except Exception:
-            failed = True
-            reason = "cycle_completion_failed"
+        except BaseException as error:
+            cycle_status = _fail_plan_cycle(
+                audit, cycle_id, "cycle_completion_failed"
+            )
+            if not isinstance(error, Exception):
+                raise
+            return cycle_status
+    return _fail_plan_cycle(audit, cycle_id, reason)
+
+
+def _fail_plan_cycle(audit: AuditRepository, cycle_id: int, reason: str) -> str:
+    """Best-effort terminalization which never masks an active interrupt."""
+
     try:
         audit.record_cycle_transition(cycle_id, "failed", {"reason": reason})
         return "failed"
@@ -211,10 +223,12 @@ def run_audited_plan(
     """
     try:
         decision = gateway.check_plan(plan)
-    except Exception:
+    except BaseException as error:
         cycle_status = _terminalize_plan_cycle(
             audit, cycle_id, failed=True, reason="capability_check_failed"
         )
+        if not isinstance(error, Exception):
+            raise
         return AuditedActionSummary("failed", cycle_status=cycle_status)
     if not decision.allowed:
         cycle_status = _terminalize_plan_cycle(
@@ -228,10 +242,12 @@ def run_audited_plan(
     if plan.mode is Mode.DRY_RUN:
         try:
             before_data = gateway.capture_before(plan)
-        except Exception:
+        except BaseException as error:
             cycle_status = _terminalize_plan_cycle(
                 audit, cycle_id, failed=True, reason="before_snapshot_failed"
             )
+            if not isinstance(error, Exception):
+                raise
             return AuditedActionSummary("failed", cycle_status=cycle_status)
 
     try:
@@ -241,10 +257,12 @@ def run_audited_plan(
             f"manual-{sha256(f'{cycle_id}:{plan.finding_fingerprint}:{plan.mode.value}'.encode('utf-8')).hexdigest()}",
             None,
         )
-    except Exception:
+    except BaseException as error:
         cycle_status = _terminalize_plan_cycle(
             audit, cycle_id, failed=True, reason="intent_persistence_failed"
         )
+        if not isinstance(error, Exception):
+            raise
         return AuditedActionSummary("failed", cycle_status=cycle_status)
     if acquisition.status != "acquired" or acquisition.action_id is None:
         cycle_status = _terminalize_plan_cycle(
@@ -258,12 +276,18 @@ def run_audited_plan(
         try:
             assert before_data is not None
             audit.record_snapshot(action_id, "before", before_data)
-        except Exception:
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                _fail_plan_cycle(audit, cycle_id, "dry_run_snapshot_interrupted")
+                raise
             failed = True
         try:
             after_data = gateway.capture_after(plan)
             audit.record_snapshot(action_id, "after", after_data)
-        except Exception:
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                _fail_plan_cycle(audit, cycle_id, "dry_run_snapshot_interrupted")
+                raise
             failed = True
         cycle_status = _terminalize_plan_cycle(
             audit,
@@ -281,14 +305,21 @@ def run_audited_plan(
     try:
         before_data = gateway.capture_before(plan)
         audit.record_snapshot(action_id, "before", before_data)
-    except Exception:
-        action_status, _ = _persist_terminal_with_fallback(
-            audit,
-            action_id,
-            plan,
-            _manual_failure_result(plan, clock, "before_snapshot_failed"),
-            clock,
-        )
+    except BaseException as error:
+        if not isinstance(error, Exception):
+            _fail_plan_cycle(audit, cycle_id, "before_snapshot_interrupted")
+            raise
+        try:
+            action_status, _ = _persist_terminal_with_fallback(
+                audit,
+                action_id,
+                plan,
+                _manual_failure_result(plan, clock, "before_snapshot_failed"),
+                clock,
+            )
+        except BaseException:
+            _fail_plan_cycle(audit, cycle_id, "failure_persistence_interrupted")
+            raise
         cycle_status = _terminalize_plan_cycle(
             audit,
             cycle_id,
@@ -307,10 +338,12 @@ def run_audited_plan(
             action_id,
             ActionResult(plan.action_kind, ActionStatus.EXECUTING, plan.target_key, clock()),
         )
-    except Exception:
+    except BaseException as error:
         cycle_status = _terminalize_plan_cycle(
             audit, cycle_id, failed=True, reason="executing_persistence_failed"
         )
+        if not isinstance(error, Exception):
+            raise
         return AuditedActionSummary(
             "failed",
             action_status=ActionStatus.PLANNED.value,
@@ -320,27 +353,49 @@ def run_audited_plan(
 
     try:
         result = gateway.execute(plan)
-    except Exception:
-        occurred_at = clock()
-        result = ActionResult(
-            plan.action_kind,
-            ActionStatus.OUTCOME_UNKNOWN,
-            plan.target_key,
-            occurred_at,
-            occurred_at,
-            error="gateway_dispatch_exception",
-        )
+    except BaseException as error:
+        if not isinstance(error, Exception):
+            _fail_plan_cycle(audit, cycle_id, "gateway_dispatch_interrupted")
+            raise
+        try:
+            occurred_at = clock()
+            result = ActionResult(
+                plan.action_kind,
+                ActionStatus.OUTCOME_UNKNOWN,
+                plan.target_key,
+                occurred_at,
+                occurred_at,
+                error="gateway_dispatch_exception",
+            )
+        except BaseException:
+            _fail_plan_cycle(audit, cycle_id, "dispatch_result_interrupted")
+            raise
 
     post_failed = False
     try:
         after_data = gateway.capture_after(plan)
         audit.record_snapshot(action_id, "after", after_data)
-    except Exception:
+    except BaseException as error:
+        if not isinstance(error, Exception):
+            try:
+                _persist_terminal_with_fallback(audit, action_id, plan, result, clock)
+            except BaseException as persistence_error:
+                _fail_plan_cycle(
+                    audit, cycle_id, "terminal_result_persistence_interrupted"
+                )
+                if not isinstance(persistence_error, Exception):
+                    raise
+            _fail_plan_cycle(audit, cycle_id, "after_snapshot_interrupted")
+            raise
         post_failed = True
 
-    action_status, persistence_failed = _persist_terminal_with_fallback(
-        audit, action_id, plan, result, clock
-    )
+    try:
+        action_status, persistence_failed = _persist_terminal_with_fallback(
+            audit, action_id, plan, result, clock
+        )
+    except BaseException:
+        _fail_plan_cycle(audit, cycle_id, "terminal_result_persistence_interrupted")
+        raise
     post_failed = post_failed or persistence_failed
     cycle_status = _terminalize_plan_cycle(
         audit,

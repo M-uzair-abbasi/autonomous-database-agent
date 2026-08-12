@@ -304,6 +304,23 @@ class CliTests(unittest.TestCase):
             "public", "orders_customer_idx", config, confirmed=True
         )
         target_id = repository.register_target(config.database_dsn, "fixture")
+        unrelated_cycle = repository.start_cycle(target_id, Mode.OBSERVE)
+        unrelated_event_id = repository.record_finding(
+            unrelated_cycle,
+            Finding(
+                rule_id=RuleId.UNUSED_LARGE_INDEX,
+                severity=Severity.WARNING,
+                target_kind=TargetKind.INDEX,
+                target_key="unrelated-index-identity",
+                evidence={"index_name": "unrelated_idx"},
+                recommendation="review separately",
+                action_eligible=False,
+                observed_at=NOW,
+                fingerprint="unused-index-unrelated-cli-fixture",
+            ),
+            "indexes",
+        )
+        repository.finish_cycle(unrelated_cycle, {"indexes": True})
         cycle_id = repository.start_cycle(target_id, config.mode)
         event_id = repository.record_finding(
             cycle_id,
@@ -341,6 +358,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(json.loads(stdout)["status"], "recovered_orphan")
         self.assertEqual(repository.list_actions(target_id)[0]["state"], "outcome_unknown")
         self.assertEqual(orphan.action_id, repository.list_actions(target_id)[0]["id"])
+        unrelated = next(
+            item for item in repository.list_events(target_id) if item["id"] == unrelated_event_id
+        )
+        self.assertEqual(unrelated["state"], "detected")
 
     def test_reindex_capability_exception_is_terminal_and_secret_free(self) -> None:
         audit_path = Path(self.tempdir.name) / "capability.sqlite3"
@@ -370,6 +391,59 @@ class CliTests(unittest.TestCase):
                 )
             ]
         self.assertEqual(states, ["started", "failed"])
+
+    def test_post_cycle_start_interrupts_terminalize_then_return_130(self) -> None:
+        for stage in ("reconcile", "finding", "gateway", "recovered_finish"):
+            with self.subTest(stage=stage):
+                audit_path = Path(self.tempdir.name) / f"interrupt-{stage}.sqlite3"
+
+                class Repository(SQLiteAuditRepository):
+                    def reconcile_orphans(self) -> list[int]:
+                        if stage == "reconcile":
+                            raise KeyboardInterrupt
+                        if stage == "recovered_finish":
+                            return [991]
+                        return super().reconcile_orphans()
+
+                    def record_finding(self, *args: object, **kwargs: object) -> int:
+                        if stage == "finding":
+                            raise KeyboardInterrupt
+                        return super().record_finding(*args, **kwargs)
+
+                    def finish_cycle(
+                        self, cycle_id: int, collector_statuses: dict[str, bool]
+                    ) -> int:
+                        if stage == "recovered_finish":
+                            raise KeyboardInterrupt
+                        return super().finish_cycle(cycle_id, collector_statuses)
+
+                repository = Repository(audit_path)
+
+                def gateway_factory(config: HealingConfig) -> object:
+                    if stage == "gateway":
+                        raise KeyboardInterrupt
+                    return _Gateway(config)
+
+                code, stdout, stderr = self.run_cli(
+                    ["reindex", "public", "orders_customer_idx", "--mode", "act", "--confirm"],
+                    environ={
+                        "SCM_HEALING_ALLOW_MANUAL_REINDEX": "1",
+                        "SCM_HEALING_AUDIT_PATH": str(audit_path),
+                    },
+                    audit_factory=lambda path: repository,
+                    gateway_factory=gateway_factory,
+                )
+
+                self.assertEqual((code, stderr), (130, ""))
+                self.assertEqual(json.loads(stdout), {"command": "reindex", "status": "interrupted"})
+                with repository._connect() as connection:
+                    states = [
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT state FROM cycle_transition ORDER BY id"
+                        )
+                    ]
+                self.assertEqual(states, ["started", "failed"])
 
 
 if __name__ == "__main__":

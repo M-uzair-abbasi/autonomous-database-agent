@@ -117,14 +117,21 @@ class ManualSagaGateway:
         failure: str | None = None,
         repository: SQLiteAuditRepository | None = None,
         target_id: int | None = None,
+        interrupt: str | None = None,
     ) -> None:
         self.failure = failure
         self.repository = repository
         self.target_id = target_id
         self.execute_count = 0
         self.committed_before_execute = False
+        self.interrupt = interrupt
+
+    def _interrupt(self, stage: str) -> None:
+        if self.interrupt == stage:
+            raise KeyboardInterrupt
 
     def check_plan(self, plan: ActionPlan) -> CapabilityDecision:
+        self._interrupt("check")
         if self.failure == "check":
             raise OSError("postgresql://operator:secret@db.invalid/production")
         if self.failure == "check_rejected":
@@ -132,6 +139,7 @@ class ManualSagaGateway:
         return CapabilityDecision(True, "ok")
 
     def capture_before(self, plan: ActionPlan) -> Mapping[str, object]:
+        self._interrupt("before_capture")
         if self.failure == "before_capture":
             raise OSError("before snapshot unavailable")
         return {"present": True, "stage": "before"}
@@ -144,6 +152,7 @@ class ManualSagaGateway:
                 action["state"] == "executing"
                 and [item["stage"] for item in action["snapshots"]] == ["before"]
             )
+        self._interrupt("dispatch")
         if self.failure == "execute":
             raise OSError("postgresql://operator:secret@db.invalid/production")
         return ActionResult(
@@ -155,6 +164,7 @@ class ManualSagaGateway:
         )
 
     def capture_after(self, plan: ActionPlan) -> Mapping[str, object]:
+        self._interrupt("after_capture")
         if self.failure == "after_capture":
             raise OSError("after snapshot unavailable")
         return {"present": True, "stage": "after"}
@@ -165,8 +175,11 @@ class ManualSagaRepository(SQLiteAuditRepository):
         super().__init__(*args, **kwargs)
         self.failure: str | None = None
         self.result_failures = 0
+        self.interrupt: str | None = None
 
     def acquire_action_intent(self, *args: object, **kwargs: object) -> ActionIntentAcquisition:
+        if self.interrupt == "intent":
+            raise KeyboardInterrupt
         if self.failure == "intent":
             raise OSError("postgresql://operator:secret@db.invalid/production")
         return super().acquire_action_intent(*args, **kwargs)
@@ -174,11 +187,17 @@ class ManualSagaRepository(SQLiteAuditRepository):
     def record_snapshot(
         self, action_attempt_id: int, stage: str, data: Mapping[str, object]
     ) -> int:
+        if self.interrupt == f"{stage}_snapshot":
+            raise KeyboardInterrupt
         if self.failure == f"{stage}_snapshot":
             raise OSError("snapshot journal unavailable")
         return super().record_snapshot(action_attempt_id, stage, data)
 
     def record_action_result(self, action_attempt_id: int, result: ActionResult) -> int:
+        if self.interrupt == "executing_write" and result.status is ActionStatus.EXECUTING:
+            raise KeyboardInterrupt
+        if self.interrupt == "terminal_result" and result.status is not ActionStatus.EXECUTING:
+            raise KeyboardInterrupt
         if self.failure == "executing_write" and result.status is ActionStatus.EXECUTING:
             raise OSError("executing transition unavailable")
         if (
@@ -191,6 +210,8 @@ class ManualSagaRepository(SQLiteAuditRepository):
         return super().record_action_result(action_attempt_id, result)
 
     def finish_cycle(self, cycle_id: int, collector_statuses: Mapping[str, bool]) -> int:
+        if self.interrupt == "finish_cycle":
+            raise KeyboardInterrupt
         if self.failure == "finish_cycle":
             raise OSError("cycle completion unavailable")
         return super().finish_cycle(cycle_id, collector_statuses)
@@ -243,13 +264,15 @@ class AuditedManualActionTests(unittest.TestCase):
                 )
             ]
 
-    def _run(self, failure: str | None = None):
+    def _run(self, failure: str | None = None, interrupt: str | None = None):
         cycle_id, event_id = self._started_event()
         self.repository.failure = failure
+        self.repository.interrupt = interrupt
         gateway = ManualSagaGateway(
             failure=failure,
             repository=self.repository,
             target_id=self.target_id,
+            interrupt=interrupt,
         )
         summary = run_audited_plan(
             cycle_id,
@@ -260,6 +283,26 @@ class AuditedManualActionTests(unittest.TestCase):
             clock=MutableClock(),
         )
         return cycle_id, gateway, summary
+
+    def _seed_unrelated_index_event(self) -> int:
+        cycle_id = self.repository.start_cycle(self.target_id, Mode.OBSERVE)
+        event_id = self.repository.record_finding(
+            cycle_id,
+            Finding(
+                rule_id=RuleId.UNUSED_LARGE_INDEX,
+                severity=Severity.WARNING,
+                target_kind=TargetKind.INDEX,
+                target_key="unrelated-index-identity",
+                evidence={"index_name": "unrelated_idx"},
+                recommendation="review separately",
+                action_eligible=False,
+                observed_at=NOW,
+                fingerprint="unused-index-unrelated-fixture",
+            ),
+            "indexes",
+        )
+        self.repository.finish_cycle(cycle_id, {"indexes": True})
+        return event_id
 
     def test_act_commits_intent_and_before_snapshot_before_execute(self) -> None:
         cycle_id, gateway, summary = self._run()
@@ -335,6 +378,179 @@ class AuditedManualActionTests(unittest.TestCase):
         self.assertEqual(action["state"], "simulated")
         self.assertEqual([item["stage"] for item in action["snapshots"]], ["before", "after"])
         self.assertEqual(self._cycle_states(cycle_id), ["started", "completed"])
+
+    def test_manual_success_and_dry_run_never_clear_unrelated_index_event(self) -> None:
+        for mode in (Mode.ACT, Mode.DRY_RUN):
+            with self.subTest(mode=mode.value):
+                self.tearDown()
+                self.setUp()
+                if mode is Mode.DRY_RUN:
+                    self.config = HealingConfig(
+                        database_dsn=self.config.database_dsn,
+                        mode=mode,
+                        audit_path=self.path,
+                        allow_manual_reindex=True,
+                    )
+                    self.plan = ActionPlanner().plan_manual_reindex(
+                        "public", "orders_customer_idx", self.config
+                    )
+                unrelated_event_id = self._seed_unrelated_index_event()
+
+                self._run()
+
+                unrelated = next(
+                    item
+                    for item in self.repository.list_events(self.target_id)
+                    if item["id"] == unrelated_event_id
+                )
+                self.assertEqual(unrelated["state"], "detected")
+
+    def test_two_manual_indexes_keep_distinct_real_audit_identities(self) -> None:
+        config = HealingConfig(
+            database_dsn=self.config.database_dsn,
+            mode=Mode.DRY_RUN,
+            audit_path=self.path,
+            allow_manual_reindex=True,
+        )
+        plans = [
+            ActionPlanner().plan_manual_reindex("public", index, config)
+            for index in ("orders_idx", "customers_idx")
+        ]
+        for offset, plan in enumerate(plans, start=1):
+            cycle_id = self.repository.start_cycle(self.target_id, config.mode)
+            event_id = self.repository.record_finding(
+                cycle_id,
+                Finding(
+                    rule_id=RuleId.UNUSED_LARGE_INDEX,
+                    severity=Severity.WARNING,
+                    target_kind=TargetKind.INDEX,
+                    target_key=plan.target_key,
+                    evidence={"query_text": "REINDEX INDEX unsafe free-form SQL"},
+                    recommendation="operator requested concurrent reindex",
+                    action_eligible=False,
+                    observed_at=NOW,
+                    fingerprint=plan.finding_fingerprint,
+                ),
+                "indexes",
+            )
+            acquisition = self.repository.acquire_action_intent(
+                event_id, plan, f"manual-identity-{offset}", None
+            )
+            self.assertIsNotNone(acquisition.action_id)
+            self.repository.finish_cycle(cycle_id, {})
+
+        events = self.repository.list_events(self.target_id)
+        actions = self.repository.list_actions(self.target_id)
+        self.assertEqual(len(events), 2)
+        self.assertEqual(len({item["fingerprint"] for item in events}), 2)
+        self.assertTrue(
+            all(item["fingerprint"].startswith("manual-index-target:") for item in events)
+        )
+        self.assertEqual(len({item["target_key"] for item in actions}), 2)
+        self.assertTrue(all(item["command"].startswith("REINDEX INDEX CONCURRENTLY") for item in actions))
+        with self.repository._connect() as connection:
+            finding_json = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT finding_json FROM anomaly_event ORDER BY id"
+                )
+            ]
+        self.assertTrue(all("[redacted-query]" in value for value in finding_json))
+
+    def test_keyboard_interrupt_terminalizes_cycle_and_preserves_recoverable_action(self) -> None:
+        cases = (
+            ("check", 0, None, False),
+            ("intent", 0, None, False),
+            ("before_capture", 0, "planned", True),
+            ("before_snapshot", 0, "planned", True),
+            ("executing_write", 0, "planned", True),
+            ("dispatch", 1, "executing", True),
+            ("after_capture", 1, "succeeded", False),
+            ("after_snapshot", 1, "succeeded", False),
+            ("terminal_result", 1, "executing", True),
+            ("finish_cycle", 1, "succeeded", False),
+        )
+        for stage, execute_count, expected_action, recoverable in cases:
+            with self.subTest(stage=stage):
+                self.tearDown()
+                self.setUp()
+                cycle_id, event_id = self._started_event()
+                self.repository.interrupt = stage
+                gateway = ManualSagaGateway(
+                    repository=self.repository,
+                    target_id=self.target_id,
+                    interrupt=stage,
+                )
+
+                with self.assertRaises(KeyboardInterrupt):
+                    run_audited_plan(
+                        cycle_id,
+                        event_id,
+                        self.plan,
+                        gateway,
+                        self.repository,
+                        clock=MutableClock(),
+                    )
+
+                actions = self.repository.list_actions(self.target_id)
+                self.assertEqual(gateway.execute_count, execute_count)
+                self.assertEqual(actions[-1]["state"] if actions else None, expected_action)
+                self.assertEqual(self._cycle_states(cycle_id)[-1], "failed")
+                if execute_count:
+                    self.assertTrue(gateway.committed_before_execute)
+                self.repository.interrupt = None
+                recovered = self.repository.reconcile_orphans()
+                self.assertEqual(bool(recovered), recoverable)
+                if recoverable:
+                    self.assertEqual(recovered, [actions[-1]["id"]])
+
+    def test_system_exit_is_terminalized_and_re_raised_as_control_flow(self) -> None:
+        cycle_id, event_id = self._started_event()
+
+        class ExitingGateway(ManualSagaGateway):
+            def check_plan(self, plan: ActionPlan) -> CapabilityDecision:
+                raise SystemExit(23)
+
+        with self.assertRaisesRegex(SystemExit, "23"):
+            run_audited_plan(
+                cycle_id,
+                event_id,
+                self.plan,
+                ExitingGateway(),
+                self.repository,
+                clock=MutableClock(),
+            )
+
+        self.assertEqual(self._cycle_states(cycle_id), ["started", "failed"])
+
+    def test_interrupt_while_terminalizing_an_ordinary_failure_is_not_swallowed(self) -> None:
+        cycle_id, event_id = self._started_event()
+
+        class InterruptedTerminalizationRepository(ManualSagaRepository):
+            def record_cycle_transition(
+                self,
+                cycle_id: int,
+                state: str,
+                detail: Mapping[str, object] | None = None,
+            ) -> int:
+                if state == "failed":
+                    raise KeyboardInterrupt
+                return super().record_cycle_transition(cycle_id, state, detail)
+
+        repository = InterruptedTerminalizationRepository(self.path, clock=MutableClock())
+        gateway = ManualSagaGateway(failure="check")
+
+        with self.assertRaises(KeyboardInterrupt):
+            run_audited_plan(
+                cycle_id,
+                event_id,
+                self.plan,
+                gateway,
+                repository,
+                clock=MutableClock(),
+            )
+
+        self.assertEqual(self._cycle_states(cycle_id), ["started"])
 
 
 class EngineModeMatrixTests(unittest.TestCase):

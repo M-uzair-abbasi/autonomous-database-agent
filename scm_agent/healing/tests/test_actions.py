@@ -132,6 +132,17 @@ class ActionPlannerTests(unittest.TestCase):
                 "public", "orders_idx", config, confirmed=True, sql="DROP TABLE orders"  # type: ignore[call-arg]
             )
 
+    def test_manual_index_identity_uses_an_opaque_non_sql_prefix(self) -> None:
+        config = HealingConfig(mode=Mode.DRY_RUN, allow_manual_reindex=True)
+
+        first = self.planner.plan_manual_reindex("public", "orders_idx", config)
+        second = self.planner.plan_manual_reindex("public", "customers_idx", config)
+
+        self.assertTrue(first.target_key.startswith("manual-index-target:"))
+        self.assertTrue(second.target_key.startswith("manual-index-target:"))
+        self.assertNotEqual(first.target_key, second.target_key)
+        self.assertNotIn("reindex", first.target_key.casefold())
+
     def test_table_pressure_maps_to_fixed_vacuum_in_dry_run_and_act(self) -> None:
         item = finding(RuleId.DEAD_TUPLE_PRESSURE, TargetKind.TABLE)
 

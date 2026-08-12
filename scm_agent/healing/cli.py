@@ -157,50 +157,45 @@ def _manual_reindex(
     cycle_id = audit.start_cycle(target_id, config.mode)  # type: ignore[attr-defined]
     try:
         recovered = audit.reconcile_orphans()  # type: ignore[attr-defined]
-    except Exception:
-        try:
-            audit.record_cycle_transition(  # type: ignore[attr-defined]
-                cycle_id, "failed", {"reason": "orphan_reconciliation_failed"}
-            )
-        except Exception:
-            pass
+    except BaseException as error:
+        _fail_manual_cycle(audit, cycle_id, "orphan_reconciliation_failed")
+        if not isinstance(error, Exception):
+            raise
         return EXIT_OPERATION_FAILED, {"command": "reindex", "status": "failed"}
     if recovered:
         try:
-            audit.finish_cycle(cycle_id, {"indexes": True})  # type: ignore[attr-defined]
-        except Exception:
-            try:
-                audit.record_cycle_transition(  # type: ignore[attr-defined]
-                    cycle_id, "failed", {"reason": "cycle_completion_failed"}
-                )
-            except Exception:
-                pass
+            audit.finish_cycle(cycle_id, {})  # type: ignore[attr-defined]
+        except BaseException as error:
+            _fail_manual_cycle(audit, cycle_id, "cycle_completion_failed")
+            if not isinstance(error, Exception):
+                raise
         return EXIT_OPERATION_FAILED, {
             "command": "reindex",
             "status": "recovered_orphan",
             "recovered_count": len(recovered),
         }
-    finding = Finding(
-        rule_id=RuleId.UNUSED_LARGE_INDEX,
-        severity=Severity.WARNING,
-        target_kind=TargetKind.INDEX,
-        target_key=plan.target_key,
-        evidence={"schema_name": arguments.schema, "index_name": arguments.index, "manual": True},
-        recommendation="operator requested concurrent reindex",
-        action_eligible=False,
-        observed_at=datetime.now(timezone.utc),
-        fingerprint=plan.finding_fingerprint,
-    )
     try:
+        finding = Finding(
+            rule_id=RuleId.UNUSED_LARGE_INDEX,
+            severity=Severity.WARNING,
+            target_kind=TargetKind.INDEX,
+            target_key=plan.target_key,
+            evidence={
+                "schema_name": arguments.schema,
+                "index_name": arguments.index,
+                "manual": True,
+            },
+            recommendation="operator requested concurrent reindex",
+            action_eligible=False,
+            observed_at=datetime.now(timezone.utc),
+            fingerprint=plan.finding_fingerprint,
+        )
         event_id = audit.record_finding(cycle_id, finding, "indexes")  # type: ignore[attr-defined]
         gateway = gateway_factory(config)
-    except Exception:
-        try:
-            audit.record_cycle_transition(  # type: ignore[attr-defined]
-                cycle_id, "failed", {"reason": "manual_setup_failed"}
-            )
-        except Exception:
-            pass
+    except BaseException as error:
+        _fail_manual_cycle(audit, cycle_id, "manual_setup_failed")
+        if not isinstance(error, Exception):
+            raise
         return EXIT_OPERATION_FAILED, {"command": "reindex", "status": "failed"}
     summary = run_audited_plan(
         cycle_id,
@@ -219,6 +214,17 @@ def _manual_reindex(
     if summary.action_status is not None:
         payload["action_status"] = summary.action_status
     return code, payload
+
+
+def _fail_manual_cycle(audit: object, cycle_id: int, reason: str) -> None:
+    """Best-effort manual-cycle failure without masking control flow."""
+
+    try:
+        audit.record_cycle_transition(  # type: ignore[attr-defined]
+            cycle_id, "failed", {"reason": reason}
+        )
+    except Exception:
+        pass
 
 
 def main(

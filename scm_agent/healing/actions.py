@@ -102,7 +102,7 @@ def _backend_target(finding: Finding) -> BackendTarget:
 
 def _manual_fingerprint(schema: str, index: str) -> str:
     identity = f"{schema}\x00{index}".encode("utf-8")
-    return f"manual-reindex:{sha256(identity).hexdigest()}"
+    return f"manual-index-target:{sha256(identity).hexdigest()}"
 
 
 def _is_system_schema(schema: str) -> bool:
