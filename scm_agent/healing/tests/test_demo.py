@@ -25,7 +25,7 @@ class _Cursor:
         return self
 
     def fetchone(self) -> tuple[int]:
-        return (4321,)
+        return (self.connection.database_name,)  # type: ignore[return-value]
 
     def __enter__(self) -> "_Cursor":
         return self
@@ -35,9 +35,15 @@ class _Cursor:
 
 
 class _Connection:
-    def __init__(self, application_name: str, autocommit: bool) -> None:
+    def __init__(
+        self,
+        application_name: str,
+        autocommit: bool,
+        database_name: str = "scm_ovs_demo_viva",
+    ) -> None:
         self.application_name = application_name
         self.autocommit = autocommit
+        self.database_name = database_name
         self.statements: list[tuple[str, object]] = []
         self.closed = False
         self.rolled_back = False
@@ -59,12 +65,25 @@ class _Connection:
 
 
 class _Connector:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        database_name: str = "scm_ovs_demo_viva",
+        fail_on_call: int | None = None,
+    ) -> None:
         self.connections: list[_Connection] = []
+        self.database_name = database_name
+        self.fail_on_call = fail_on_call
+        self.calls = 0
 
     def __call__(self, dsn: str, **kwargs: object) -> _Connection:
+        self.calls += 1
+        if self.calls == self.fail_on_call:
+            raise OSError("connection unavailable")
         connection = _Connection(
-            str(kwargs["application_name"]), bool(kwargs["autocommit"])
+            str(kwargs["application_name"]),
+            bool(kwargs["autocommit"]),
+            self.database_name,
         )
         self.connections.append(connection)
         return connection
@@ -86,6 +105,32 @@ class DemoGuardTests(unittest.TestCase):
 
     def test_unparseable_and_lookalike_database_names_fail_closed(self) -> None:
         for dsn in ("not-a-dsn", "postgresql://localhost/not_scm_ovs_demo_viva"):
+            with self.subTest(dsn=dsn):
+                with self.assertRaises(DemoGuardError):
+                    ensure_disposable_target(dsn, {})
+
+    def test_ambiguous_uri_database_specs_and_encoding_fail_closed(self) -> None:
+        adversarial = (
+            "postgresql://localhost/scm_ovs_demo_viva?dbname=production",
+            "postgresql://localhost/scm_ovs_demo_viva?DATABASE=production",
+            "postgresql://localhost/scm_ovs_demo_viva?%64bname=production",
+            "postgresql://localhost/scm_ovs_demo_viva?database=scm_ovs_demo_viva%00production",
+            "postgresql://localhost/%73cm_ovs_demo_viva",
+            "postgresql://localhost/scm_ovs_demo_viva#production",
+        )
+        for dsn in adversarial:
+            with self.subTest(dsn=dsn):
+                with self.assertRaises(DemoGuardError):
+                    ensure_disposable_target(dsn, {})
+
+    def test_duplicate_or_unsafe_keyword_database_specs_fail_closed(self) -> None:
+        adversarial = (
+            "dbname=scm_ovs_demo_viva dbname=production host=localhost",
+            "DBNAME=scm_ovs_demo_viva database=production host=localhost",
+            "dbname='scm_ovs_demo_viva' host=localhost",
+            r"dbname=scm_ovs_demo_viva\ host=production",
+        )
+        for dsn in adversarial:
             with self.subTest(dsn=dsn):
                 with self.assertRaises(DemoGuardError):
                     ensure_disposable_target(dsn, {})
@@ -128,6 +173,38 @@ class DemoRunnerTests(unittest.TestCase):
         self.assertEqual(len(autovacuum_statements), 1)
         self.assertNotIn("ALTER DATABASE", sql.upper())
         self.assertTrue(self.connector.connections[0].application_name.startswith(DEMO_PREFIX))
+        self.assertIn(
+            "SELECT pg_catalog.current_database()",
+            self.connector.connections[0].statements[0][0],
+        )
+
+    def test_live_effective_database_is_verified_before_any_demo_mutation(self) -> None:
+        self.connector = _Connector(database_name="production")
+
+        with self.assertRaises(DemoGuardError):
+            self.runner().setup_bloat(rows=100)
+
+        connection = self.connector.connections[0]
+        self.assertTrue(connection.closed)
+        self.assertEqual(
+            connection.statements,
+            [("SELECT pg_catalog.current_database()", None)],
+        )
+
+    def test_current_override_still_queries_effective_database_before_mutation(self) -> None:
+        self.connector = _Connector(database_name="production")
+        runner = DemoRunner(
+            self.config,
+            environ={"SCM_HEALING_ALLOW_DEMO": "1"},
+            connect=self.connector,
+            wait=lambda seconds: None,
+        )
+
+        runner.setup_bloat(rows=10)
+
+        statements = self.connector.connections[0].statements
+        self.assertEqual(statements[0], ("SELECT pg_catalog.current_database()", None))
+        self.assertTrue(any("CREATE TABLE" in sql for sql, _ in statements[1:]))
 
     def test_bloat_rows_are_positive_and_bounded_before_connecting(self) -> None:
         runner = self.runner()
@@ -158,6 +235,21 @@ class DemoRunnerTests(unittest.TestCase):
         self.assertTrue(
             all(item.application_name == "scm_ovs_demo_pressure" for item in self.connector.connections)
         )
+        self.assertTrue(
+            all(
+                item.statements[0] == ("SELECT pg_catalog.current_database()", None)
+                for item in self.connector.connections
+            )
+        )
+
+    def test_pressure_partial_open_failure_closes_every_prior_connection(self) -> None:
+        self.connector = _Connector(fail_on_call=3)
+
+        with self.assertRaises(OSError):
+            self.runner().hold_pressure(connections=4, seconds=1)
+
+        self.assertEqual(len(self.connector.connections), 2)
+        self.assertTrue(all(connection.closed for connection in self.connector.connections))
 
     def test_pressure_rejects_out_of_range_count_before_opening_connections(self) -> None:
         runner = self.runner()

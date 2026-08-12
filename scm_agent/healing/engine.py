@@ -94,6 +94,17 @@ class CycleSummary:
     recovered_orphan_count: int = 0
 
 
+@dataclass(frozen=True)
+class AuditedActionSummary:
+    """Secret-free terminal state for one already-correlated manual plan."""
+
+    status: str
+    action_status: str | None = None
+    action_id: int | None = None
+    executed: bool = False
+    cycle_status: str = "completed"
+
+
 _COLLECTORS = ("activity", "tables", "indexes", "saturation")
 _RULE_COLLECTOR = {
     RuleId.DEAD_TUPLE_PRESSURE: "tables",
@@ -122,6 +133,233 @@ _COLLECTOR_ALIASES = {
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _terminalize_plan_cycle(
+    audit: AuditRepository,
+    cycle_id: int,
+    *,
+    failed: bool,
+    reason: str,
+) -> str:
+    if not failed:
+        try:
+            audit.finish_cycle(cycle_id, {"indexes": True})
+            return "completed"
+        except Exception:
+            failed = True
+            reason = "cycle_completion_failed"
+    try:
+        audit.record_cycle_transition(cycle_id, "failed", {"reason": reason})
+        return "failed"
+    except Exception:
+        return "unterminated"
+
+
+def _manual_failure_result(plan: ActionPlan, clock: Clock, reason: str) -> ActionResult:
+    occurred_at = clock()
+    return ActionResult(
+        plan.action_kind,
+        ActionStatus.FAILED,
+        plan.target_key,
+        occurred_at,
+        occurred_at,
+        error=reason,
+    )
+
+
+def _persist_terminal_with_fallback(
+    audit: AuditRepository,
+    action_id: int,
+    plan: ActionPlan,
+    result: ActionResult,
+    clock: Clock,
+) -> tuple[str | None, bool]:
+    try:
+        audit.record_action_result(action_id, result)
+        return result.status.value, False
+    except Exception:
+        occurred_at = clock()
+        fallback = ActionResult(
+            plan.action_kind,
+            ActionStatus.OUTCOME_UNKNOWN,
+            plan.target_key,
+            occurred_at,
+            occurred_at,
+            error="terminal_result_persistence_failed",
+        )
+        try:
+            audit.record_action_result(action_id, fallback)
+            return ActionStatus.OUTCOME_UNKNOWN.value, True
+        except Exception:
+            return None, True
+
+
+def run_audited_plan(
+    cycle_id: int,
+    event_id: int,
+    plan: ActionPlan,
+    gateway: HealthGateway,
+    audit: AuditRepository,
+    *,
+    clock: Clock = _utc_now,
+) -> AuditedActionSummary:
+    """Run one manual plan with a durable intent and failure-safe terminalization.
+
+    The caller owns target registration, cycle start, correlation, and orphan
+    reconciliation. This helper owns every live/action stage after correlation.
+    """
+    try:
+        decision = gateway.check_plan(plan)
+    except Exception:
+        cycle_status = _terminalize_plan_cycle(
+            audit, cycle_id, failed=True, reason="capability_check_failed"
+        )
+        return AuditedActionSummary("failed", cycle_status=cycle_status)
+    if not decision.allowed:
+        cycle_status = _terminalize_plan_cycle(
+            audit, cycle_id, failed=False, reason="precondition_rejected"
+        )
+        return AuditedActionSummary(
+            "precondition_rejected", cycle_status=cycle_status
+        )
+
+    before_data: Mapping[str, object] | None = None
+    if plan.mode is Mode.DRY_RUN:
+        try:
+            before_data = gateway.capture_before(plan)
+        except Exception:
+            cycle_status = _terminalize_plan_cycle(
+                audit, cycle_id, failed=True, reason="before_snapshot_failed"
+            )
+            return AuditedActionSummary("failed", cycle_status=cycle_status)
+
+    try:
+        acquisition = audit.acquire_action_intent(
+            event_id,
+            plan,
+            f"manual-{sha256(f'{cycle_id}:{plan.finding_fingerprint}:{plan.mode.value}'.encode('utf-8')).hexdigest()}",
+            None,
+        )
+    except Exception:
+        cycle_status = _terminalize_plan_cycle(
+            audit, cycle_id, failed=True, reason="intent_persistence_failed"
+        )
+        return AuditedActionSummary("failed", cycle_status=cycle_status)
+    if acquisition.status != "acquired" or acquisition.action_id is None:
+        cycle_status = _terminalize_plan_cycle(
+            audit, cycle_id, failed=False, reason="intent_not_acquired"
+        )
+        return AuditedActionSummary(acquisition.status, cycle_status=cycle_status)
+
+    action_id = acquisition.action_id
+    if plan.mode is Mode.DRY_RUN:
+        failed = False
+        try:
+            assert before_data is not None
+            audit.record_snapshot(action_id, "before", before_data)
+        except Exception:
+            failed = True
+        try:
+            after_data = gateway.capture_after(plan)
+            audit.record_snapshot(action_id, "after", after_data)
+        except Exception:
+            failed = True
+        cycle_status = _terminalize_plan_cycle(
+            audit,
+            cycle_id,
+            failed=failed,
+            reason="dry_run_snapshot_failed",
+        )
+        return AuditedActionSummary(
+            "failed" if failed or cycle_status != "completed" else "simulated",
+            action_status=ActionStatus.SIMULATED.value,
+            action_id=action_id,
+            cycle_status=cycle_status,
+        )
+
+    try:
+        before_data = gateway.capture_before(plan)
+        audit.record_snapshot(action_id, "before", before_data)
+    except Exception:
+        action_status, _ = _persist_terminal_with_fallback(
+            audit,
+            action_id,
+            plan,
+            _manual_failure_result(plan, clock, "before_snapshot_failed"),
+            clock,
+        )
+        cycle_status = _terminalize_plan_cycle(
+            audit,
+            cycle_id,
+            failed=True,
+            reason="before_snapshot_failed",
+        )
+        return AuditedActionSummary(
+            "failed",
+            action_status=action_status,
+            action_id=action_id,
+            cycle_status=cycle_status,
+        )
+
+    try:
+        audit.record_action_result(
+            action_id,
+            ActionResult(plan.action_kind, ActionStatus.EXECUTING, plan.target_key, clock()),
+        )
+    except Exception:
+        cycle_status = _terminalize_plan_cycle(
+            audit, cycle_id, failed=True, reason="executing_persistence_failed"
+        )
+        return AuditedActionSummary(
+            "failed",
+            action_status=ActionStatus.PLANNED.value,
+            action_id=action_id,
+            cycle_status=cycle_status,
+        )
+
+    try:
+        result = gateway.execute(plan)
+    except Exception:
+        occurred_at = clock()
+        result = ActionResult(
+            plan.action_kind,
+            ActionStatus.OUTCOME_UNKNOWN,
+            plan.target_key,
+            occurred_at,
+            occurred_at,
+            error="gateway_dispatch_exception",
+        )
+
+    post_failed = False
+    try:
+        after_data = gateway.capture_after(plan)
+        audit.record_snapshot(action_id, "after", after_data)
+    except Exception:
+        post_failed = True
+
+    action_status, persistence_failed = _persist_terminal_with_fallback(
+        audit, action_id, plan, result, clock
+    )
+    post_failed = post_failed or persistence_failed
+    cycle_status = _terminalize_plan_cycle(
+        audit,
+        cycle_id,
+        failed=post_failed,
+        reason="post_action_audit_failed",
+    )
+    operation_status = (
+        "failed"
+        if post_failed or cycle_status != "completed"
+        else (action_status or "failed")
+    )
+    return AuditedActionSummary(
+        operation_status,
+        action_status=action_status,
+        action_id=action_id,
+        executed=True,
+        cycle_status=cycle_status,
+    )
 
 
 class HealingEngine:

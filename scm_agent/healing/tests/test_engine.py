@@ -10,9 +10,9 @@ from typing import Mapping
 import unittest
 
 from scm_agent.healing.actions import ActionPlanner
-from scm_agent.healing.audit import SQLiteAuditRepository
+from scm_agent.healing.audit import ActionIntentAcquisition, SQLiteAuditRepository
 from scm_agent.healing.config import HealingConfig
-from scm_agent.healing.engine import HealingEngine
+from scm_agent.healing.engine import HealingEngine, run_audited_plan
 from scm_agent.healing.models import (
     ActionKind,
     ActionPlan,
@@ -21,10 +21,14 @@ from scm_agent.healing.models import (
     ActivitySample,
     CollectionError,
     ConnectionSample,
+    Finding,
     HealthSnapshot,
     IndexStatsSample,
     Mode,
+    RuleId,
+    Severity,
     TableStatsSample,
+    TargetKind,
 )
 from scm_agent.healing.postgres import CapabilityDecision
 from scm_agent.healing.rules import detect_all
@@ -104,6 +108,233 @@ class FakeGateway:
     def capture_after(self, plan: ActionPlan) -> Mapping[str, object]:
         self.read_trace.append(f"after:{plan.target_key}")
         return {"present": True, "dead_tuples": 0}
+
+
+class ManualSagaGateway:
+    def __init__(
+        self,
+        *,
+        failure: str | None = None,
+        repository: SQLiteAuditRepository | None = None,
+        target_id: int | None = None,
+    ) -> None:
+        self.failure = failure
+        self.repository = repository
+        self.target_id = target_id
+        self.execute_count = 0
+        self.committed_before_execute = False
+
+    def check_plan(self, plan: ActionPlan) -> CapabilityDecision:
+        if self.failure == "check":
+            raise OSError("postgresql://operator:secret@db.invalid/production")
+        if self.failure == "check_rejected":
+            return CapabilityDecision(False, "stale_relation_identity")
+        return CapabilityDecision(True, "ok")
+
+    def capture_before(self, plan: ActionPlan) -> Mapping[str, object]:
+        if self.failure == "before_capture":
+            raise OSError("before snapshot unavailable")
+        return {"present": True, "stage": "before"}
+
+    def execute(self, plan: ActionPlan) -> ActionResult:
+        self.execute_count += 1
+        if self.repository is not None and self.target_id is not None:
+            action = self.repository.list_actions(self.target_id)[-1]
+            self.committed_before_execute = (
+                action["state"] == "executing"
+                and [item["stage"] for item in action["snapshots"]] == ["before"]
+            )
+        if self.failure == "execute":
+            raise OSError("postgresql://operator:secret@db.invalid/production")
+        return ActionResult(
+            plan.action_kind,
+            ActionStatus.SUCCEEDED,
+            plan.target_key,
+            NOW,
+            NOW + timedelta(seconds=1),
+        )
+
+    def capture_after(self, plan: ActionPlan) -> Mapping[str, object]:
+        if self.failure == "after_capture":
+            raise OSError("after snapshot unavailable")
+        return {"present": True, "stage": "after"}
+
+
+class ManualSagaRepository(SQLiteAuditRepository):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.failure: str | None = None
+        self.result_failures = 0
+
+    def acquire_action_intent(self, *args: object, **kwargs: object) -> ActionIntentAcquisition:
+        if self.failure == "intent":
+            raise OSError("postgresql://operator:secret@db.invalid/production")
+        return super().acquire_action_intent(*args, **kwargs)
+
+    def record_snapshot(
+        self, action_attempt_id: int, stage: str, data: Mapping[str, object]
+    ) -> int:
+        if self.failure == f"{stage}_snapshot":
+            raise OSError("snapshot journal unavailable")
+        return super().record_snapshot(action_attempt_id, stage, data)
+
+    def record_action_result(self, action_attempt_id: int, result: ActionResult) -> int:
+        if self.failure == "executing_write" and result.status is ActionStatus.EXECUTING:
+            raise OSError("executing transition unavailable")
+        if (
+            self.failure in ("result_write", "result_write_repeated")
+            and result.status is not ActionStatus.EXECUTING
+            and (self.failure == "result_write_repeated" or self.result_failures == 0)
+        ):
+            self.result_failures += 1
+            raise OSError("terminal transition unavailable")
+        return super().record_action_result(action_attempt_id, result)
+
+    def finish_cycle(self, cycle_id: int, collector_statuses: Mapping[str, bool]) -> int:
+        if self.failure == "finish_cycle":
+            raise OSError("cycle completion unavailable")
+        return super().finish_cycle(cycle_id, collector_statuses)
+
+
+class AuditedManualActionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.path = Path(self.tempdir.name) / "manual.sqlite3"
+        self.repository = ManualSagaRepository(self.path, clock=MutableClock())
+        self.config = HealingConfig(
+            database_dsn="postgresql://operator:secret@db.invalid/scm_demo",
+            mode=Mode.ACT,
+            audit_path=self.path,
+            allow_manual_reindex=True,
+        )
+        self.plan = ActionPlanner().plan_manual_reindex(
+            "public", "orders_customer_idx", self.config, confirmed=True
+        )
+        self.target_id = self.repository.register_target(
+            self.config.database_dsn, "manual-fixture"
+        )
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def _started_event(self) -> tuple[int, int]:
+        cycle_id = self.repository.start_cycle(self.target_id, self.config.mode)
+        finding = Finding(
+            rule_id=RuleId.UNUSED_LARGE_INDEX,
+            severity=Severity.WARNING,
+            target_kind=TargetKind.INDEX,
+            target_key=self.plan.target_key,
+            evidence={"manual": True},
+            recommendation="operator requested concurrent reindex",
+            action_eligible=False,
+            observed_at=NOW,
+            fingerprint=self.plan.finding_fingerprint,
+        )
+        event_id = self.repository.record_finding(cycle_id, finding, "indexes")
+        return cycle_id, event_id
+
+    def _cycle_states(self, cycle_id: int) -> list[str]:
+        with self.repository._connect() as connection:
+            return [
+                str(row["state"])
+                for row in connection.execute(
+                    "SELECT state FROM cycle_transition WHERE cycle_id = ? ORDER BY id",
+                    (cycle_id,),
+                )
+            ]
+
+    def _run(self, failure: str | None = None):
+        cycle_id, event_id = self._started_event()
+        self.repository.failure = failure
+        gateway = ManualSagaGateway(
+            failure=failure,
+            repository=self.repository,
+            target_id=self.target_id,
+        )
+        summary = run_audited_plan(
+            cycle_id,
+            event_id,
+            self.plan,
+            gateway,
+            self.repository,
+            clock=MutableClock(),
+        )
+        return cycle_id, gateway, summary
+
+    def test_act_commits_intent_and_before_snapshot_before_execute(self) -> None:
+        cycle_id, gateway, summary = self._run()
+
+        self.assertEqual((summary.status, summary.action_status), ("succeeded", "succeeded"))
+        self.assertEqual(gateway.execute_count, 1)
+        self.assertTrue(gateway.committed_before_execute)
+        self.assertEqual(self.repository.list_actions(self.target_id)[0]["state"], "succeeded")
+        self.assertEqual(self._cycle_states(cycle_id), ["started", "completed"])
+
+    def test_pre_dispatch_failures_never_execute_and_terminalize_or_remain_recoverable(self) -> None:
+        cases = (
+            ("check", None, "failed"),
+            ("check_rejected", None, "completed"),
+            ("intent", None, "failed"),
+            ("before_capture", "failed", "failed"),
+            ("before_snapshot", "failed", "failed"),
+            ("executing_write", "planned", "failed"),
+        )
+        for failure, expected_action, expected_cycle in cases:
+            with self.subTest(failure=failure):
+                self.tearDown()
+                self.setUp()
+                cycle_id, gateway, summary = self._run(failure)
+                actions = self.repository.list_actions(self.target_id)
+                self.assertEqual(gateway.execute_count, 0)
+                self.assertEqual(actions[-1]["state"] if actions else None, expected_action)
+                self.assertEqual(self._cycle_states(cycle_id)[-1], expected_cycle)
+                self.assertNotIn("secret", repr(summary))
+                if failure == "executing_write":
+                    self.repository.failure = None
+                    self.assertEqual(self.repository.reconcile_orphans(), [actions[-1]["id"]])
+
+    def test_post_dispatch_failures_preserve_known_result_or_fallback_unknown(self) -> None:
+        cases = (
+            ("execute", "outcome_unknown", "completed"),
+            ("after_capture", "succeeded", "failed"),
+            ("after_snapshot", "succeeded", "failed"),
+            ("result_write", "outcome_unknown", "failed"),
+            ("result_write_repeated", "executing", "failed"),
+            ("finish_cycle", "succeeded", "failed"),
+        )
+        for failure, expected_action, expected_cycle in cases:
+            with self.subTest(failure=failure):
+                self.tearDown()
+                self.setUp()
+                cycle_id, gateway, summary = self._run(failure)
+                action = self.repository.list_actions(self.target_id)[-1]
+                self.assertEqual(gateway.execute_count, 1)
+                self.assertEqual(action["state"], expected_action)
+                self.assertEqual(self._cycle_states(cycle_id)[-1], expected_cycle)
+                self.assertNotIn("secret", repr(summary))
+                if failure == "result_write_repeated":
+                    self.repository.failure = None
+                    self.assertEqual(self.repository.reconcile_orphans(), [action["id"]])
+
+    def test_dry_run_is_simulated_with_snapshots_and_never_executes(self) -> None:
+        self.config = HealingConfig(
+            database_dsn=self.config.database_dsn,
+            mode=Mode.DRY_RUN,
+            audit_path=self.path,
+            allow_manual_reindex=True,
+        )
+        self.plan = ActionPlanner().plan_manual_reindex(
+            "public", "orders_customer_idx", self.config
+        )
+
+        cycle_id, gateway, summary = self._run()
+
+        action = self.repository.list_actions(self.target_id)[-1]
+        self.assertEqual((summary.status, summary.action_status), ("simulated", "simulated"))
+        self.assertEqual(gateway.execute_count, 0)
+        self.assertEqual(action["state"], "simulated")
+        self.assertEqual([item["stage"] for item in action["snapshots"]], ["before", "after"])
+        self.assertEqual(self._cycle_states(cycle_id), ["started", "completed"])
 
 
 class EngineModeMatrixTests(unittest.TestCase):

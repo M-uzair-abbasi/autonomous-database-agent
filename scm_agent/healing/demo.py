@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import shlex
+import re
 import time
 from typing import Callable, Mapping, Protocol
-from urllib.parse import unquote, urlsplit
+from urllib.parse import urlsplit
 
 from .config import HealingConfig
 
@@ -20,6 +20,9 @@ _BLOAT_APPLICATION = f"{DEMO_PREFIX}bloat_setup"
 _IDLE_APPLICATION = f"{DEMO_PREFIX}idle_transaction"
 _PRESSURE_APPLICATION = f"{DEMO_PREFIX}pressure"
 _CLEANUP_APPLICATION = f"{DEMO_PREFIX}cleanup"
+_CURRENT_DATABASE_SQL = "SELECT pg_catalog.current_database()"
+_SIMPLE_DATABASE_NAME = re.compile(r"[A-Za-z0-9_.-]+")
+_CONNINFO_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 _CREATE_BLOAT_SQL = f"""
 CREATE TABLE IF NOT EXISTS \"{BLOAT_TABLE}\" (
@@ -66,6 +69,7 @@ class DemoGuardError(RuntimeError):
 
 class _Cursor(Protocol):
     def execute(self, sql: object, parameters: object = None) -> object: ...
+    def fetchone(self) -> object: ...
     def __enter__(self) -> "_Cursor": ...
     def __exit__(self, *args: object) -> object: ...
 
@@ -83,29 +87,51 @@ def _database_name(dsn: str) -> str | None:
         parsed = urlsplit(dsn)
     except ValueError:
         return None
-    if parsed.scheme in ("postgres", "postgresql"):
-        name = unquote(parsed.path.lstrip("/"))
-        return name if name and "/" not in name else None
-    try:
-        fields = shlex.split(dsn)
-    except ValueError:
+    if parsed.scheme.casefold() in ("postgres", "postgresql"):
+        if parsed.fragment or "%" in parsed.path or "%" in parsed.query:
+            return None
+        if not parsed.path.startswith("/") or parsed.path.count("/") != 1:
+            return None
+        name = parsed.path[1:]
+        if _SIMPLE_DATABASE_NAME.fullmatch(name) is None:
+            return None
+        for field in parsed.query.split("&") if parsed.query else ():
+            key = field.split("=", 1)[0].casefold()
+            if key in ("dbname", "database"):
+                return None
+        return name
+    if parsed.scheme:
+        return None
+    if any(character in dsn for character in ("'", '"', "\\")):
         return None
     values: dict[str, str] = {}
-    for field in fields:
-        if "=" not in field:
+    database_specs: list[str] = []
+    for field in dsn.split():
+        if field.count("=") != 1:
             return None
         key, value = field.split("=", 1)
-        values[key] = value
-    name = values.get("dbname") or values.get("database")
-    return name if name else None
+        normalized_key = key.casefold()
+        if (
+            _CONNINFO_KEY.fullmatch(key) is None
+            or not value
+            or normalized_key in values
+        ):
+            return None
+        values[normalized_key] = value
+        if normalized_key in ("dbname", "database"):
+            database_specs.append(value)
+    if len(database_specs) != 1:
+        return None
+    name = database_specs[0]
+    return name if _SIMPLE_DATABASE_NAME.fullmatch(name) is not None else None
 
 
 def ensure_disposable_target(dsn: str, environ: Mapping[str, str]) -> None:
     """Fail closed unless the database is named disposable or override is current."""
     database_name = _database_name(dsn)
     explicitly_allowed = environ.get("SCM_HEALING_ALLOW_DEMO") == "1"
-    if not explicitly_allowed and (
-        database_name is None or not database_name.startswith(DEMO_PREFIX)
+    if database_name is None or (
+        not explicitly_allowed and not database_name.startswith(DEMO_PREFIX)
     ):
         raise DemoGuardError(
             "demo refused: use a database named scm_ovs_demo_* or set SCM_HEALING_ALLOW_DEMO=1"
@@ -149,12 +175,33 @@ class DemoRunner:
                     "PostgreSQL live demos require the project Psycopg dependency"
                 ) from exc
             connector = psycopg.connect
-        return connector(
+        connection = connector(
             self._config.database_dsn,
             application_name=application_name,
             autocommit=autocommit,
             connect_timeout=5,
         )
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(_CURRENT_DATABASE_SQL)
+                row = cursor.fetchone()
+            if (
+                not isinstance(row, (tuple, list))
+                or len(row) != 1
+                or not isinstance(row[0], str)
+            ):
+                raise DemoGuardError("demo refused: effective database could not be verified")
+            if (
+                self._environ.get("SCM_HEALING_ALLOW_DEMO") != "1"
+                and not row[0].startswith(DEMO_PREFIX)
+            ):
+                raise DemoGuardError("demo refused: effective database is not disposable")
+            if not autocommit:
+                connection.rollback()
+            return connection
+        except BaseException:
+            connection.close()
+            raise
 
     @staticmethod
     def _validate_duration(seconds: float | None) -> None:

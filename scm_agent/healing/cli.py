@@ -6,7 +6,6 @@ import argparse
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -14,15 +13,7 @@ import sys
 from typing import Callable, Mapping, Sequence
 
 from .config import HealingConfig
-from .models import (
-    ActionResult,
-    ActionStatus,
-    Finding,
-    Mode,
-    RuleId,
-    Severity,
-    TargetKind,
-)
+from .models import Finding, Mode, RuleId, Severity, TargetKind
 
 
 EXIT_OK = 0
@@ -151,9 +142,10 @@ def _manual_reindex(
     arguments: argparse.Namespace,
     config: HealingConfig,
     audit: object,
-    gateway: object,
+    gateway_factory: Callable[[HealingConfig], object],
 ) -> tuple[int, dict[str, object]]:
     from .actions import ActionPlanner
+    from .engine import run_audited_plan
 
     plan = ActionPlanner().plan_manual_reindex(
         arguments.schema,
@@ -161,16 +153,33 @@ def _manual_reindex(
         config,
         confirmed=arguments.confirm,
     )
-    decision = gateway.check_plan(plan)  # type: ignore[attr-defined]
-    if not decision.allowed:
-        return EXIT_UNAVAILABLE, {
-            "command": "reindex",
-            "status": "rejected",
-            "reason": decision.reason,
-        }
-
     target_id = audit.register_target(config.database_dsn, "scm-ovs-target")  # type: ignore[attr-defined]
     cycle_id = audit.start_cycle(target_id, config.mode)  # type: ignore[attr-defined]
+    try:
+        recovered = audit.reconcile_orphans()  # type: ignore[attr-defined]
+    except Exception:
+        try:
+            audit.record_cycle_transition(  # type: ignore[attr-defined]
+                cycle_id, "failed", {"reason": "orphan_reconciliation_failed"}
+            )
+        except Exception:
+            pass
+        return EXIT_OPERATION_FAILED, {"command": "reindex", "status": "failed"}
+    if recovered:
+        try:
+            audit.finish_cycle(cycle_id, {"indexes": True})  # type: ignore[attr-defined]
+        except Exception:
+            try:
+                audit.record_cycle_transition(  # type: ignore[attr-defined]
+                    cycle_id, "failed", {"reason": "cycle_completion_failed"}
+                )
+            except Exception:
+                pass
+        return EXIT_OPERATION_FAILED, {
+            "command": "reindex",
+            "status": "recovered_orphan",
+            "recovered_count": len(recovered),
+        }
     finding = Finding(
         rule_id=RuleId.UNUSED_LARGE_INDEX,
         severity=Severity.WARNING,
@@ -182,45 +191,34 @@ def _manual_reindex(
         observed_at=datetime.now(timezone.utc),
         fingerprint=plan.finding_fingerprint,
     )
-    event_id = audit.record_finding(cycle_id, finding, "indexes")  # type: ignore[attr-defined]
-    key_source = f"{cycle_id}\x00{plan.finding_fingerprint}\x00{config.mode.value}"
-    acquisition = audit.acquire_action_intent(  # type: ignore[attr-defined]
+    try:
+        event_id = audit.record_finding(cycle_id, finding, "indexes")  # type: ignore[attr-defined]
+        gateway = gateway_factory(config)
+    except Exception:
+        try:
+            audit.record_cycle_transition(  # type: ignore[attr-defined]
+                cycle_id, "failed", {"reason": "manual_setup_failed"}
+            )
+        except Exception:
+            pass
+        return EXIT_OPERATION_FAILED, {"command": "reindex", "status": "failed"}
+    summary = run_audited_plan(
+        cycle_id,
         event_id,
         plan,
-        f"manualreindex-{sha256(key_source.encode('utf-8')).hexdigest()}",
-        None,
+        gateway,  # type: ignore[arg-type]
+        audit,  # type: ignore[arg-type]
     )
-    if acquisition.status != "acquired" or acquisition.action_id is None:
-        audit.finish_cycle(cycle_id, {"indexes": True})  # type: ignore[attr-defined]
-        return EXIT_OPERATION_FAILED, {"command": "reindex", "status": acquisition.status}
-
-    action_id = acquisition.action_id
-    audit.record_snapshot(action_id, "before", gateway.capture_before(plan))  # type: ignore[attr-defined]
-    if config.mode is Mode.DRY_RUN:
-        now = datetime.now(timezone.utc)
-        result = ActionResult(
-            plan.action_kind,
-            ActionStatus.SIMULATED,
-            plan.target_key,
-            now,
-            now,
-            evidence={"reason": "dry_run"},
-        )
+    if summary.status in ("succeeded", "simulated"):
+        code = EXIT_OK
+    elif summary.status == "precondition_rejected":
+        code = EXIT_UNAVAILABLE
     else:
-        now = datetime.now(timezone.utc)
-        audit.record_action_result(  # type: ignore[attr-defined]
-            action_id,
-            ActionResult(plan.action_kind, ActionStatus.EXECUTING, plan.target_key, now),
-        )
-        result = gateway.execute(plan)  # type: ignore[attr-defined]
-    audit.record_snapshot(action_id, "after", gateway.capture_after(plan))  # type: ignore[attr-defined]
-    audit.record_action_result(action_id, result)  # type: ignore[attr-defined]
-    audit.finish_cycle(cycle_id, {"indexes": True})  # type: ignore[attr-defined]
-    success = result.status in (ActionStatus.SIMULATED, ActionStatus.SUCCEEDED)
-    return (EXIT_OK if success else EXIT_OPERATION_FAILED), {
-        "command": "reindex",
-        "status": result.status.value,
-    }
+        code = EXIT_OPERATION_FAILED
+    payload: dict[str, object] = {"command": "reindex", "status": summary.status}
+    if summary.action_status is not None:
+        payload["action_status"] = summary.action_status
+    return code, payload
 
 
 def main(
@@ -296,8 +294,7 @@ def main(
 
         if arguments.command == "reindex":
             audit = make_audit(config.audit_path)
-            gateway = make_gateway(config)
-            code, payload = _manual_reindex(arguments, config, audit, gateway)
+            code, payload = _manual_reindex(arguments, config, audit, make_gateway)
             _emit(payload)
             return code
 

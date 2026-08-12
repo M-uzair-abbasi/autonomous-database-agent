@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import asdict
+from datetime import datetime, timezone
 from io import StringIO
 import json
 from pathlib import Path
@@ -13,11 +14,24 @@ import tempfile
 import unittest
 
 from scm_agent.healing import cli
+from scm_agent.healing.actions import ActionPlanner
+from scm_agent.healing.audit import SQLiteAuditRepository
+from scm_agent.healing.config import HealingConfig
 from scm_agent.healing.engine import CycleSummary
-from scm_agent.healing.models import Mode
+from scm_agent.healing.models import (
+    ActionResult,
+    ActionStatus,
+    Finding,
+    Mode,
+    RuleId,
+    Severity,
+    TargetKind,
+)
+from scm_agent.healing.postgres import CapabilityDecision
 
 
 SECRET_DSN = "postgresql://operator:audit-sentinel-password@db.invalid/production"
+NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 
 
 class _Audit:
@@ -114,6 +128,23 @@ class CliTests(unittest.TestCase):
             {"command": "once", "result": asdict(CycleSummary(status="completed", finding_count=2))},
         )
 
+    def test_run_keyboard_interrupt_returns_structured_exit_130(self) -> None:
+        class Engine:
+            def __init__(self, config: object, gateway: object, audit: object) -> None:
+                pass
+
+            def run_forever(self, stop: object) -> None:
+                raise KeyboardInterrupt
+
+        code, stdout, stderr = self.run_cli(
+            ["run"],
+            audit_factory=_Audit,
+            gateway_factory=_Gateway,
+            engine_factory=Engine,
+        )
+        self.assertEqual((code, stderr), (130, ""))
+        self.assertEqual(json.loads(stdout), {"command": "run", "status": "interrupted"})
+
     def test_events_and_actions_read_only_sqlite_without_constructing_gateway(self) -> None:
         def forbidden_gateway(config: object) -> object:
             raise AssertionError("listing commands must not construct PostgreSQL gateway")
@@ -198,6 +229,147 @@ class CliTests(unittest.TestCase):
                 )
                 self.assertEqual((code, stdout), (2, ""))
                 self.assertEqual(json.loads(stderr)["error"], expected_error)
+
+    def test_reindex_starts_cycle_before_capability_and_commits_before_execute(self) -> None:
+        audit_path = Path(self.tempdir.name) / "manual.sqlite3"
+        repository = SQLiteAuditRepository(audit_path)
+
+        class Gateway:
+            execute_count = 0
+            saw_started_cycle = False
+            saw_committed_intent = False
+
+            def __init__(self, config: HealingConfig) -> None:
+                self.config = config
+
+            def check_plan(self, plan: object) -> CapabilityDecision:
+                with repository._connect() as connection:
+                    self.saw_started_cycle = connection.execute(
+                        "SELECT COUNT(*) FROM poll_cycle"
+                    ).fetchone()[0] == 1
+                return CapabilityDecision(True, "ok")
+
+            def capture_before(self, plan: object) -> dict[str, object]:
+                return {"present": True}
+
+            def execute(self, plan: object) -> ActionResult:
+                self.execute_count += 1
+                actions = repository.list_actions(repository.list_targets()[0]["id"])
+                self.saw_committed_intent = actions[-1]["state"] == "executing"
+                return ActionResult(
+                    plan.action_kind,  # type: ignore[attr-defined]
+                    ActionStatus.SUCCEEDED,
+                    plan.target_key,  # type: ignore[attr-defined]
+                    NOW,
+                    NOW,
+                )
+
+            def capture_after(self, plan: object) -> dict[str, object]:
+                return {"present": True}
+
+        gateway = Gateway(
+            HealingConfig(
+                database_dsn=SECRET_DSN,
+                mode=Mode.ACT,
+                audit_path=audit_path,
+                allow_manual_reindex=True,
+            )
+        )
+        code, stdout, stderr = self.run_cli(
+            ["reindex", "public", "orders_customer_idx", "--mode", "act", "--confirm"],
+            environ={
+                "SCM_HEALING_ALLOW_MANUAL_REINDEX": "1",
+                "SCM_HEALING_AUDIT_PATH": str(audit_path),
+            },
+            audit_factory=lambda path: repository,
+            gateway_factory=lambda config: gateway,
+        )
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout)["status"], "succeeded")
+        self.assertTrue(gateway.saw_started_cycle)
+        self.assertTrue(gateway.saw_committed_intent)
+        self.assertEqual(gateway.execute_count, 1)
+
+    def test_later_reindex_run_reconciles_orphan_before_database_io(self) -> None:
+        audit_path = Path(self.tempdir.name) / "reconcile.sqlite3"
+        repository = SQLiteAuditRepository(audit_path)
+        config = HealingConfig(
+            database_dsn=SECRET_DSN,
+            mode=Mode.ACT,
+            audit_path=audit_path,
+            allow_manual_reindex=True,
+        )
+        plan = ActionPlanner().plan_manual_reindex(
+            "public", "orders_customer_idx", config, confirmed=True
+        )
+        target_id = repository.register_target(config.database_dsn, "fixture")
+        cycle_id = repository.start_cycle(target_id, config.mode)
+        event_id = repository.record_finding(
+            cycle_id,
+            Finding(
+                rule_id=RuleId.UNUSED_LARGE_INDEX,
+                severity=Severity.WARNING,
+                target_kind=TargetKind.INDEX,
+                target_key=plan.target_key,
+                evidence={"manual": True},
+                recommendation="manual",
+                action_eligible=False,
+                observed_at=NOW,
+                fingerprint=plan.finding_fingerprint,
+            ),
+            "indexes",
+        )
+        orphan = repository.acquire_action_intent(
+            event_id, plan, "manual-orphan-fixture", None
+        )
+
+        def forbidden_gateway(config: HealingConfig) -> object:
+            raise AssertionError("reconciliation must occur before PostgreSQL adapter construction")
+
+        code, stdout, stderr = self.run_cli(
+            ["reindex", "public", "orders_customer_idx", "--mode", "act", "--confirm"],
+            environ={
+                "SCM_HEALING_ALLOW_MANUAL_REINDEX": "1",
+                "SCM_HEALING_AUDIT_PATH": str(audit_path),
+            },
+            audit_factory=lambda path: repository,
+            gateway_factory=forbidden_gateway,
+        )
+
+        self.assertEqual((code, stderr), (1, ""))
+        self.assertEqual(json.loads(stdout)["status"], "recovered_orphan")
+        self.assertEqual(repository.list_actions(target_id)[0]["state"], "outcome_unknown")
+        self.assertEqual(orphan.action_id, repository.list_actions(target_id)[0]["id"])
+
+    def test_reindex_capability_exception_is_terminal_and_secret_free(self) -> None:
+        audit_path = Path(self.tempdir.name) / "capability.sqlite3"
+        repository = SQLiteAuditRepository(audit_path)
+
+        class Gateway:
+            def check_plan(self, plan: object) -> CapabilityDecision:
+                raise OSError(SECRET_DSN)
+
+        code, stdout, stderr = self.run_cli(
+            ["reindex", "public", "orders_customer_idx", "--mode", "act", "--confirm"],
+            environ={
+                "SCM_HEALING_ALLOW_MANUAL_REINDEX": "1",
+                "SCM_HEALING_AUDIT_PATH": str(audit_path),
+            },
+            audit_factory=lambda path: repository,
+            gateway_factory=lambda config: Gateway(),
+        )
+
+        self.assertEqual((code, stderr), (1, ""))
+        self.assertEqual(json.loads(stdout), {"command": "reindex", "status": "failed"})
+        with repository._connect() as connection:
+            states = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT state FROM cycle_transition ORDER BY id"
+                )
+            ]
+        self.assertEqual(states, ["started", "failed"])
 
 
 if __name__ == "__main__":
