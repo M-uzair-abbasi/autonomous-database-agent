@@ -1,0 +1,26 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local tool and editor state
+.claude/
+.idea/
+.vscode/
+*.swp
+
+# Healing engine audit journal — runtime state, not source
+var/
+
+# Evaluation output
+results/
+*.results.json
+
+# OS noise
+.DS_Store
+Thumbs.db

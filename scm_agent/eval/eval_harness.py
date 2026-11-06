@@ -184,6 +184,17 @@ class Outcome(str, Enum):
     failed. Not the model's fault and not gradeable; a run containing any of
     these is warned about loudly and should be repeated."""
 
+    TRUNCATED_INCONCLUSIVE = "truncated-inconclusive"
+    """Neither correct nor incorrect: at least one side of the comparison was
+    cut off at `max_rows`, so only a prefix was compared.
+
+    Previously such a case was scored `MATCH` with a note appended to `detail`
+    — and `detail` is only printed for failures, so the caveat was invisible
+    while the case counted as correct. A query returning the expected first N
+    rows plus arbitrary extra rows therefore received full credit, inflating
+    the headline accuracy. A partial comparison is not evidence either way, so
+    it is excluded from the denominator instead."""
+
     SKIPPED_REFERENCE_FAILED = "skipped-reference-failed"
     """The *reference* query would not execute here, so there is nothing to
     compare against. Excluded from the denominator — see the module docstring."""
@@ -194,8 +205,17 @@ class Outcome(str, Enum):
 
     @property
     def is_scored(self) -> bool:
-        """Whether this case counts toward the accuracy denominator."""
-        return self is not Outcome.SKIPPED_REFERENCE_FAILED
+        """Whether this case counts toward the accuracy denominator.
+
+        Both excluded outcomes are environment problems, not model problems:
+        a reference query that would not run, and a comparison that could only
+        see the first `max_rows` rows. Charging either to the model would
+        misstate the headline number, in opposite directions.
+        """
+        return self not in (
+            Outcome.SKIPPED_REFERENCE_FAILED,
+            Outcome.TRUNCATED_INCONCLUSIVE,
+        )
 
 
 DIFFICULTY_ORDER: tuple[str, ...] = ("easy", "medium", "hard")
@@ -844,14 +864,23 @@ def run_case(
     actual = ResultSet(result.columns, result.rows, result.truncated)
 
     if outcome is Outcome.MISMATCH:
-        comparison = compare_result_sets(reference, actual, ordered)
-        outcome = Outcome.MATCH if comparison.match else Outcome.MISMATCH
-        detail = comparison.detail
         if reference.truncated or actual.truncated:
-            # A truncated comparison is not a comparison. Say so rather than
-            # reporting a match that only holds for the first `max_rows` rows.
-            note = f"result truncated at max_rows={max_rows}; comparison is partial"
-            detail = f"{detail}; {note}" if detail else note
+            # Decided BEFORE the comparison, not after. A truncated comparison
+            # is not a comparison: a candidate returning the expected first
+            # `max_rows` rows plus arbitrary extra rows would compare equal on
+            # the prefix. Previously this still produced MATCH and only
+            # appended a note to `detail`, which is not printed for passing
+            # cases — so the case counted as correct and the caveat was
+            # invisible. Excluded from the denominator instead.
+            outcome = Outcome.TRUNCATED_INCONCLUSIVE
+            detail = (
+                f"result truncated at max_rows={max_rows}; only a prefix could "
+                "be compared, so this case is not scored"
+            )
+        else:
+            comparison = compare_result_sets(reference, actual, ordered)
+            outcome = Outcome.MATCH if comparison.match else Outcome.MISMATCH
+            detail = comparison.detail
 
     return CaseResult(
         id=case.id,
@@ -1213,12 +1242,39 @@ def print_report(run: EvalRun) -> None:
         f"= {_percent(run.accuracy).strip()} execution accuracy"
     )
     if run.skipped:
+        # Broken down by reason. The two unscored outcomes have different
+        # meanings and lumping them under "the reference query does not run"
+        # would misdescribe a truncated comparison as a broken test case.
+        reference_failed = sum(
+            1 for r in run.results if r.outcome is Outcome.SKIPPED_REFERENCE_FAILED
+        )
+        truncated = sum(
+            1 for r in run.results if r.outcome is Outcome.TRUNCATED_INCONCLUSIVE
+        )
         print(
-            f"  ({run.skipped} of {len(run.results)} case(s) skipped: the reference "
-            f"query itself does not run on {run.executed_dialect}. Counting those "
-            f"as failures instead would give "
+            f"  ({run.skipped} of {len(run.results)} case(s) not scored. Counting "
+            f"them as failures instead would give "
             f"{_percent(run.accuracy_including_skipped).strip()} — shown only so "
             "the denominator is never in doubt.)"
+        )
+        if reference_failed:
+            print(
+                f"    {reference_failed} — the reference query itself does not run "
+                f"on {run.executed_dialect} (harness/environment, not the model)"
+            )
+        if truncated:
+            print(
+                f"    {truncated} — result truncated at max_rows, so only a prefix "
+                "could be compared (raise --max-rows to score these)"
+            )
+
+    # A number computed from a handful of cases is not a result. Say so loudly
+    # rather than letting a small denominator produce a flattering percentage.
+    if run.results and len(run.scored) * 2 < len(run.results):
+        print(
+            f"  WARNING: only {len(run.scored)} of {len(run.results)} cases were "
+            "gradeable. This accuracy figure is not report-quality — fix the "
+            "skipped cases and re-run before quoting it."
         )
     pipeline_errors = sum(1 for r in run.results if r.outcome is Outcome.PIPELINE_ERROR)
     if pipeline_errors:

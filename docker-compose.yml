@@ -14,7 +14,10 @@ name: scm-ovs
 
 services:
   db:
-    image: postgres:16
+    # PostgreSQL 16 with the pgvector extension available, for the retrieval
+    # store (schema chunks + verified question/SQL pairs). Same major version as
+    # plain postgres:16, so nothing else about the database changes.
+    image: pgvector/pgvector:pg16
     container_name: scm-ovs-db
     environment:
       POSTGRES_DB: scm_demo

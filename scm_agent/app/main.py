@@ -81,6 +81,8 @@ import urllib.parse
 from contextlib import contextmanager
 from typing import Any, Iterator, NamedTuple
 
+from scm_agent.app.healing_api import MAX_ROWS as HEALING_MAX_ROWS
+from scm_agent.app.healing_api import read_audit
 from scm_agent.pipeline.config import AppConfig, Dialect, get_config
 from scm_agent.pipeline.model_client import ModelClient
 from scm_agent.pipeline.nl_to_sql import (
@@ -589,7 +591,7 @@ def run_query(
     config: AppConfig | None = None,
     conn: Any | None = None,
     max_rows: int = DEFAULT_MAX_ROWS,
-    include_samples: bool = True,
+    include_samples: bool = False,
     client: ModelClient | None = None,
 ) -> ApiResponse:
     """Run one question through the pipeline and shape it as an HTTP response.
@@ -809,6 +811,18 @@ def create_app(config: AppConfig | None = None):
     @api.post("/query")
     def query(body: dict = body_param(...)):  # pragma: no cover
         status, payload = query_endpoint(body, resolved)
+        return json_response(status_code=status, content=payload)
+
+    @api.get("/healing/audit")
+    def healing_audit(limit: int = HEALING_MAX_ROWS):  # pragma: no cover
+        """What the self-healing engine has detected and done. Read-only.
+
+        Deliberately has no counterpart that *starts* healing. Running a
+        maintenance action stays behind the CLI, where it requires an explicit
+        mode and a confirmation; a dashboard button that could issue a VACUUM
+        is a different and far more dangerous product.
+        """
+        status, payload = read_audit(limit=limit)
         return json_response(status_code=status, content=payload)
 
     return api

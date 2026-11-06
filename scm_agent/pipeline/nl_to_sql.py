@@ -473,7 +473,7 @@ def get_schema_ddl(
     conn,
     dialect: Dialect,
     schema: str | None = None,
-    include_samples: bool = True,
+    include_samples: bool = False,
     refresh: bool = False,
 ) -> tuple[str, DatabaseSchema]:
     """Return `(ddl, schema_object)` for `conn`, cached.
@@ -531,7 +531,7 @@ def answer_question(
     question: str,
     conn,
     config: AppConfig | None = None,
-    include_samples: bool = True,
+    include_samples: bool = False,
     schema: str | None = None,
     max_rows: int = DEFAULT_MAX_ROWS,
     refresh_schema: bool = False,

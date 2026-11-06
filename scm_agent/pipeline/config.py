@@ -26,7 +26,8 @@ is a config change rather than a rewrite.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import urllib.parse
+from dataclasses import dataclass, field
 from enum import Enum
 
 
@@ -72,16 +73,21 @@ class DialectSpec:
     supports_returning: bool
     """Whether INSERT/UPDATE ... RETURNING exists. Postgres-family only."""
 
+    sqlglot_name: str
+    """The dialect name sqlglot parses with, e.g. "postgres" or "tsql"."""
+
 
 DIALECT_SPECS: dict[Dialect, DialectSpec] = {
     Dialect.POSTGRESQL: DialectSpec(
         prompt_name="PostgreSQL",
+        sqlglot_name="postgres",
         identifier_quotes=('"',),
         line_comment_tokens=("--",),
         supports_returning=True,
     ),
     Dialect.MYSQL: DialectSpec(
         prompt_name="MySQL",
+        sqlglot_name="mysql",
         identifier_quotes=("`",),
         # MySQL additionally treats `#` as a line comment, which is exactly the
         # kind of dialect quirk an injection attempt would hide behind.
@@ -90,6 +96,7 @@ DIALECT_SPECS: dict[Dialect, DialectSpec] = {
     ),
     Dialect.SQLSERVER: DialectSpec(
         prompt_name="SQL Server",
+        sqlglot_name="tsql",
         identifier_quotes=("[", "]", '"'),
         line_comment_tokens=("--",),
         supports_returning=False,
@@ -98,6 +105,7 @@ DIALECT_SPECS: dict[Dialect, DialectSpec] = {
         # OmniSQL's native training dialect — useful as a control when we
         # measure how much the fine-tune costs us on the dialect it started on.
         prompt_name="SQLite",
+        sqlglot_name="sqlite",
         identifier_quotes=('"', "`", "[", "]"),
         line_comment_tokens=("--",),
         supports_returning=True,
@@ -112,7 +120,10 @@ class ModelConfig:
     provider: ModelProvider
     model_name: str
     base_url: str | None
-    api_key: str | None
+    api_key: str | None = field(repr=False)
+    """Excluded from `repr`: a dataclass repr prints every field, so this object
+    landing in a traceback, a log line or an f-string would print the API key.
+    The value is unchanged and still readable as `config.model.api_key`."""
     lora_adapter: str | None
     temperature: float
     max_tokens: int
@@ -173,14 +184,21 @@ class ModelConfig:
 class DatabaseConfig:
     """Target database the agent introspects and queries."""
 
-    dsn: str
+    dsn: str = field(repr=False)
+    """Excluded from `repr` — it carries a password, and a dataclass repr prints
+    every field."""
     dialect: Dialect
 
     @classmethod
     def from_env(cls) -> "DatabaseConfig":
         return cls(
+            # Points at THIS project's disposable compose instance on 5434.
+            # The previous fallback used port 5432, which docker-compose.yml
+            # documents as belonging to an unrelated project — so running
+            # without SCM_DB_DSN set would connect to someone else's database
+            # as user `postgres`.
             dsn=os.getenv(
-                "SCM_DB_DSN", "postgresql://postgres:postgres@localhost:5432/scm_demo"
+                "SCM_DB_DSN", "postgresql://scm:scm@localhost:5434/scm_demo"
             ).strip(),
             dialect=Dialect(
                 os.getenv("SCM_DIALECT", Dialect.POSTGRESQL.value).strip().lower()
@@ -206,17 +224,48 @@ class AppConfig:
     def summary(self) -> dict[str, object]:
         """Non-secret view of the config, safe to expose on /health.
 
-        Deliberately omits the DSN — it carries a password.
+        Deliberately omits the DSN — it carries a password — and reduces the
+        model base URL to its origin. A URL may legitimately carry credentials
+        in its userinfo component (`http://user:pass@host:8000/v1`), and
+        publishing the raw value would hand them to every caller of /health.
+        Scheme, host and port are enough to answer "which endpoint is this
+        pointed at?", which is the only reason the field is there.
         """
         return {
             "stage": self.model.stage,
             "provider": self.model.provider.value,
             "served_model": self.model.served_model,
-            "base_url": self.model.base_url,
+            "base_url": _safe_origin(self.model.base_url),
             "lora_adapter": self.model.lora_adapter,
             "dialect": self.database.dialect.value,
             "dialect_prompt_name": self.database.spec.prompt_name,
         }
+
+
+def _safe_origin(url: str | None) -> str | None:
+    """Reduce a URL to `scheme://host[:port]`, dropping userinfo and path.
+
+    A base URL may legitimately carry credentials in its userinfo component
+    (`http://user:pass@gpu-box:8000/v1`), and `/health` is unauthenticated, so
+    republishing the raw value would hand those credentials to every caller.
+    The origin answers "which endpoint is this pointed at?", which is the only
+    reason the field is exposed at all.
+
+    Anything unparseable becomes `"<redacted>"` rather than being echoed back:
+    an unrecognised string is precisely the case where we cannot prove there is
+    no secret in it, so it fails closed.
+    """
+    if url is None:
+        return None
+    try:
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return "<redacted>"
+    if not parts.scheme or not parts.hostname:
+        return "<redacted>"
+    origin = f"{parts.scheme}://{parts.hostname}"
+    return f"{origin}:{port}" if port else origin
 
 
 def _clean(value: str | None) -> str | None:
